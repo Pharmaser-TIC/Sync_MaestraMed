@@ -26,6 +26,7 @@ func main() {
 	once := flag.Bool("once", false, "run a single synchronization cycle and exit")
 	envFile := flag.String("env", ".env", "file with KEY=VALUE settings; variables already set in the environment win; a missing file is ignored")
 	debug := flag.Bool("debug", false, "log every cycle, including the ones without changes")
+	check := flag.Bool("check", false, "read back what is stored in Redis, print a report and exit (1 when something is wrong); does not call the API")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -41,16 +42,50 @@ func main() {
 	}
 	log.Debug("settings file", "path", *envFile, "loaded", loaded)
 
-	if err := run(log, *once); err != nil {
+	if err := run(log, *once, *check); err != nil {
 		log.Error("fatal", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(log *slog.Logger, once bool) error {
+func newRedis(r config.Redis) *redis.Client {
+	opts := &redis.Options{Addr: r.Addr, Password: r.Password, DB: r.DB}
+	if r.TLS {
+		opts.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+	return redis.NewClient(opts)
+}
+
+// checkRedis prints what is stored in Redis; it never writes and never touches SQLite or the API.
+func checkRedis(ctx context.Context, rdb *redis.Client, cfg config.Redis) error {
+	fmt.Printf("Redis %s (db %d, tls %t), prefix %q: connection OK\n\n", cfg.Addr, cfg.DB, cfg.TLS, cfg.Prefix)
+	report, err := publish.New(rdb, cfg.Prefix, cfg.Keep).Inspect(ctx)
+	if err != nil {
+		return fmt.Errorf("reading redis: %w", err)
+	}
+	report.Write(os.Stdout)
+	if !report.OK() {
+		return fmt.Errorf("check found %d problem(s)", len(report.Problems))
+	}
+	return nil
+}
+
+func run(log *slog.Logger, once, check bool) error {
 	cfg, err := config.FromEnv()
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	rdb := newRedis(cfg.Redis)
+	defer rdb.Close()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("connecting to redis: %w", err)
+	}
+	if check {
+		return checkRedis(ctx, rdb, cfg.Redis)
 	}
 
 	st, err := store.Open(cfg.SQLitePath)
@@ -58,19 +93,6 @@ func run(log *slog.Logger, once bool) error {
 		return fmt.Errorf("opening local store: %w", err)
 	}
 	defer st.Close()
-
-	opts := &redis.Options{Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB}
-	if cfg.Redis.TLS {
-		opts.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-	}
-	rdb := redis.NewClient(opts)
-	defer rdb.Close()
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		return fmt.Errorf("connecting to redis: %w", err)
-	}
 
 	s := &syncer.Syncer{
 		Source:      api.New(cfg.APIURL, cfg.APIKey),

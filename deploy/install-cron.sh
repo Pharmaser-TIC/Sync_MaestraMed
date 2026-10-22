@@ -52,6 +52,9 @@ crontab_without_block() {
 }
 
 if [ -n "$CRON_USER" ] && [ "$(id -u)" -ne 0 ]; then die "--user needs root"; fi
+if [ "$MODE" != print ] && ! command -v "$CRONTAB_BIN" >/dev/null 2>&1; then
+  die "crontab not found (minimal Ubuntu images do not ship it). Install it: sudo apt install cron && sudo systemctl enable --now cron"
+fi
 
 if [ "$MODE" = remove ]; then
   if ! { cron -l 2>/dev/null || true; } | grep -qxF "$BEGIN"; then echo "no nt-sync entry found; nothing to remove"; exit 0; fi

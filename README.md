@@ -21,6 +21,7 @@ go run ./cmd/nt-sync              # loop
 go run ./cmd/nt-sync -once        # one cycle, then exit (what cron runs)
 go run ./cmd/nt-sync -debug       # also log cycles without changes
 go run ./cmd/nt-sync -env /etc/nt-sync.env   # settings file elsewhere
+go run ./cmd/nt-sync -check       # read Redis back and report what is stored (see below)
 ```
 
 At startup the program reads `.env` from the current folder (or the file given with `-env`). Variables that
@@ -61,6 +62,8 @@ deploy/install-cron.sh --every 5          # installs it (default: every 5 minute
 deploy/install-cron.sh --remove           # removes it
 ```
 
+- Minimal Ubuntu images (OCI, for example) do not ship `crontab`. If the script says it is missing:
+  `sudo apt install cron && sudo systemctl enable --now cron`.
 - The entry is `*/5 * * * * cd /opt/nt-sync && flock -n .nt-sync.lock ./nt-sync -once >> logs/nt-sync.log 2>&1`.
   `flock` stops a slow run from overlapping the next one; Redis also has its own lock.
 - Normal runs only log when something is published or fails, so `logs/nt-sync.log` stays small. Add a
@@ -92,6 +95,24 @@ redis-cli HGET "nt:$V:meta" con_precios
 A new version is written completely under its own prefix and only then does `nt:actual` change, so a
 reader that resolved the pointer once always sees a consistent snapshot. The previous version stays
 for the next cycle (`REDIS_KEEP_VERSIONS`); do not cache the version for longer than a few seconds.
+
+## Checking what Redis holds
+
+`nt-sync -check` connects to the Redis configured in the environment / `.env`, prints what a cycle stored
+and exits with code 1 when something is wrong. It only reads: it does not call the API and does not touch
+the SQLite copy.
+
+```sh
+cd /opt/nt-sync && ./nt-sync -check
+```
+
+It reports the version in `nt:actual`, the `meta` fields, how many rows `filas` holds, how many lookup
+sets exist per indexed field, one sample row, the versions kept, and whether the publish lock is held.
+It flags: nothing published, a pointer to a version without data, and a `meta.total` that differs from
+the rows actually stored. The sample row is printed as stored, so it shows prices when the API sent them.
+
+`-check` reads the same settings as a normal run, so `NT_API_URL` and `NT_API_KEY` must be set too, even
+though they are not used.
 
 ## Behaviour worth knowing
 
