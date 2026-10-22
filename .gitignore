@@ -1,0 +1,7 @@
+/nt-sync
+/data/
+.env
+*.db
+*.db-*
+/logs/
+.nt-sync.lock
