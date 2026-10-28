@@ -1,5 +1,8 @@
 /nt-sync
+/nt-sync.exe
 /data/
+.DS_Store
+/.atl/
 .env
 *.db
 *.db-*
