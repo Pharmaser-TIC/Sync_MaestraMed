@@ -57,9 +57,9 @@ func newRedis(r config.Redis) *redis.Client {
 }
 
 // checkRedis prints what is stored in Redis; it never writes and never touches SQLite or the API.
-func checkRedis(ctx context.Context, rdb *redis.Client, cfg config.Redis) error {
+func checkRedis(ctx context.Context, rdb *redis.Client, cfg config.Redis, searchFields []string) error {
 	fmt.Printf("Redis %s (db %d, tls %t), prefix %q: connection OK\n\n", cfg.Addr, cfg.DB, cfg.TLS, cfg.Prefix)
-	report, err := publish.New(rdb, cfg.Prefix, cfg.Keep).Inspect(ctx)
+	report, err := publish.New(rdb, cfg.Prefix, cfg.Keep).WithSearch(searchFields).Inspect(ctx)
 	if err != nil {
 		return fmt.Errorf("reading redis: %w", err)
 	}
@@ -84,8 +84,14 @@ func run(log *slog.Logger, once, check bool) error {
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		return fmt.Errorf("connecting to redis: %w", err)
 	}
+	pub := publish.New(rdb, cfg.Redis.Prefix, cfg.Redis.Keep).WithSearch(cfg.SearchFields)
+	if len(cfg.SearchFields) > 0 {
+		if err := pub.CheckSearch(ctx); err != nil {
+			return err
+		}
+	}
 	if check {
-		return checkRedis(ctx, rdb, cfg.Redis)
+		return checkRedis(ctx, rdb, cfg.Redis, cfg.SearchFields)
 	}
 
 	st, err := store.Open(cfg.SQLitePath)
@@ -97,7 +103,7 @@ func run(log *slog.Logger, once, check bool) error {
 	s := &syncer.Syncer{
 		Source:      api.New(cfg.APIURL, cfg.APIKey),
 		Store:       st,
-		Publisher:   publish.New(rdb, cfg.Redis.Prefix, cfg.Redis.Keep),
+		Publisher:   pub,
 		IndexFields: cfg.IndexFields,
 		Log:         log,
 	}

@@ -62,6 +62,27 @@ func TestPublishWritesRowsIndexesMetaAndPointer(t *testing.T) {
 	}
 }
 
+func TestWithoutSearchFieldsNoSearchDocumentsAreWritten(t *testing.T) {
+	p, mr := setup(t, 2)
+	snap, rows := build(t, "v1", `{"id":1,"nombre":"ACETAMINOFEN"}`)
+	if err := p.Publish(context.Background(), snap, rows); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range mr.Keys() {
+		if strings.Contains(k, ":doc:") || strings.HasSuffix(k, ":ft") {
+			t.Errorf("search is off but %s was written", k)
+		}
+	}
+}
+
+func TestFoldRemovesAccentsAndCase(t *testing.T) {
+	for in, want := range map[string]string{"ÁCIDO FÓLICO": "acido folico", "Niño": "nino", "ACETAMINOFEN 500": "acetaminofen 500", "Ünico çaña": "unico cana"} {
+		if got := Fold(in); got != want {
+			t.Errorf("Fold(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestPreviousVersionStaysReadableAfterTheSwitch(t *testing.T) {
 	p, mr := setup(t, 2)
 	ctx := context.Background()

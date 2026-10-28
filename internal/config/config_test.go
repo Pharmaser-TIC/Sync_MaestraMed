@@ -23,6 +23,26 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestSearchFieldsAreOffByDefaultAndParsed(t *testing.T) {
+	base := map[string]string{"NT_API_URL": "https://h/api.php", "NT_API_KEY": "k", "REDIS_ADDR": "r:6379"}
+	c, err := Load(env(base))
+	if err != nil || len(c.SearchFields) != 0 {
+		t.Fatalf("default: fields=%v err=%v", c.SearchFields, err)
+	}
+	base["NT_SEARCH_FIELDS"] = " nombre, descripcion_2 ,,"
+	c, err = Load(env(base))
+	if err != nil || len(c.SearchFields) != 2 || c.SearchFields[0] != "nombre" || c.SearchFields[1] != "descripcion_2" {
+		t.Fatalf("parsed: fields=%v err=%v", c.SearchFields, err)
+	}
+}
+
+func TestSearchFieldsRejectNamesThatAreNotPlainKeys(t *testing.T) {
+	_, err := Load(env(map[string]string{"NT_API_URL": "https://h/api.php", "NT_API_KEY": "k", "REDIS_ADDR": "r:6379", "NT_SEARCH_FIELDS": "nombre,a.b"}))
+	if err == nil || !strings.Contains(err.Error(), "NT_SEARCH_FIELDS") {
+		t.Fatalf("expected an NT_SEARCH_FIELDS error, got %v", err)
+	}
+}
+
 func TestLoadReportsEveryProblem(t *testing.T) {
 	_, err := Load(env(map[string]string{"POLL_INTERVAL": "soon", "REDIS_KEEP_VERSIONS": "0"}))
 	if err == nil {

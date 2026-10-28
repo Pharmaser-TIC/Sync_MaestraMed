@@ -42,6 +42,7 @@ Docker: `docker build -t nt-sync .` and run it with the same variables and a vol
 | `POLL_INTERVAL` | `30s` | Time between `nt_version` checks (30-60 s recommended) |
 | `SQLITE_PATH` | `data/nt.db` | Local copy |
 | `NT_INDEX_FIELDS` | `cum_facturar,cod_auf,cod_mutual,estado,contrato` | Fields that get a lookup set |
+| `NT_SEARCH_FIELDS` | empty (search off) | Fields indexed for full-text search, e.g. `descripcion,descripcion_siesa`; needs Redis 8 or Redis Stack (see "Full-text search") |
 
 ## Cron on Ubuntu
 
@@ -91,6 +92,30 @@ redis-cli SMEMBERS "nt:$V:idx:cum_facturar:123456-1"      # row keys
 redis-cli HMGET "nt:$V:filas" 17 18                       # the rows
 redis-cli HGET "nt:$V:meta" con_precios
 ```
+
+## Full-text search
+
+The lookup sets only answer exact matches. To find rows by part of a text (for example a medication
+name) set `NT_SEARCH_FIELDS=descripcion,descripcion_siesa`. It needs a Redis with the search and
+JSON modules (Redis 8, Redis Stack); at startup the program stops with a clear error when they are missing.
+
+Each version then also holds one JSON document per row (`nt:<ver>:doc:<id>`), a RediSearch index
+`nt:<ver>:ft`, and the alias `nt:ft`, which always points to the index of the current version and switches
+together with `nt:actual`. Query the alias:
+
+```sh
+redis-cli FT.SEARCH nt:ft '@descripcion:adrenalin*'      # starts with
+redis-cli FT.SEARCH nt:ft '@descripcion:*epinefrina*'      # contains
+redis-cli FT.SEARCH nt:ft '@descripcion_siesa:adrelab'     # all the words
+```
+
+RediSearch lower-cases terms but does not strip accents, so the index reads the text from a `_busqueda`
+object that the program adds to each document (lower-case, no accents; the original row is kept as is).
+**Readers must apply the same rule to the search terms**: lower-case them and replace `á é í ó ú ü ñ ç`
+by `a e i o u u n c` (`publish.Fold` does it in Go). Without it `acido*` would not find `ÁCIDO FÓLICO`.
+
+Turning `NT_SEARCH_FIELDS` on or off takes effect at the next published version. `nt-sync -check` also
+reports how many documents the search index of the current version holds.
 
 A new version is written completely under its own prefix and only then does `nt:actual` change, so a
 reader that resolved the pointer once always sees a consistent snapshot. The previous version stays

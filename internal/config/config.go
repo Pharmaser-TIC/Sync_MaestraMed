@@ -18,6 +18,7 @@ type Config struct {
 	Redis        Redis
 	SQLitePath   string
 	IndexFields  []string // snapshot fields that get a lookup set in Redis
+	SearchFields []string // snapshot fields indexed as full-text in RediSearch; empty disables search
 }
 
 // Redis groups the Redis connection settings.
@@ -76,10 +77,31 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			c.IndexFields = append(c.IndexFields, f)
 		}
 	}
+	for _, f := range strings.Split(get("NT_SEARCH_FIELDS", ""), ",") {
+		if f = strings.TrimSpace(f); f == "" {
+			continue
+		}
+		if !validFieldName(f) {
+			errs = append(errs, fmt.Errorf("NT_SEARCH_FIELDS: %q is not a valid field name (letters, digits and _ only)", f))
+			continue
+		}
+		c.SearchFields = append(c.SearchFields, f)
+	}
 	if len(errs) > 0 {
 		return Config{}, errors.Join(errs...)
 	}
 	return c, nil
+}
+
+// validFieldName accepts the characters of a plain JSON key, so a field can be used in a
+// JSON path and as a RediSearch attribute name without any escaping.
+func validFieldName(s string) bool {
+	for _, r := range s {
+		if r != '_' && (r < '0' || r > '9') && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') {
+			return false
+		}
+	}
+	return s != ""
 }
 
 // FromEnv loads the configuration from the process environment.

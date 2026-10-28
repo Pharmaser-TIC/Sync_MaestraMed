@@ -8,6 +8,10 @@
 //	<prefix>:<version>:filas           hash    row key -> row JSON
 //	<prefix>:<version>:idx:<field>:<V> set     row keys whose <field> equals V (trimmed, upper-case)
 //	<prefix>:versiones                 zset    published versions, scored by publication time
+//
+// With search fields configured (see search.go) a version also holds one JSON document per row,
+// <prefix>:<version>:doc:<row key>, a RediSearch index <prefix>:<version>:ft and the alias
+// <prefix>:ft that points to the index of the current version.
 package publish
 
 import (
@@ -32,6 +36,7 @@ type Publisher struct {
 	rdb    redis.UniversalClient
 	prefix string
 	keep   int
+	search []string // fields indexed for full-text search; empty means search is off
 }
 
 // New returns a Publisher that keeps the newest `keep` published versions (at least 1).
@@ -65,6 +70,12 @@ func (p *Publisher) Publish(ctx context.Context, snap model.Snapshot, rows []mod
 		return err
 	}
 
+	if p.searchOn() {
+		if err := p.createIndex(ctx, ver); err != nil {
+			return err
+		}
+	}
+
 	filasKey := p.key(ver, "filas")
 	for start := 0; start < len(rows); start += batchSize {
 		end := min(start+batchSize, len(rows))
@@ -74,6 +85,13 @@ func (p *Publisher) Publish(ctx context.Context, snap model.Snapshot, rows []mod
 			fields = append(fields, r.Key, r.JSON)
 			for f, v := range r.Index {
 				pipe.SAdd(ctx, p.key(ver, "idx", f, v), r.Key)
+			}
+			if p.searchOn() {
+				doc, err := p.searchDoc(r.JSON)
+				if err != nil {
+					return fmt.Errorf("row %s: %w", r.Key, err)
+				}
+				pipe.JSONSet(ctx, p.key(ver, "doc", r.Key), "$", doc)
 			}
 		}
 		pipe.HSet(ctx, filasKey, fields...)
@@ -99,6 +117,11 @@ func (p *Publisher) Publish(ctx context.Context, snap model.Snapshot, rows []mod
 	}
 	if err := p.rdb.ZAdd(ctx, p.key("versiones"), redis.Z{Score: float64(now.UnixNano()), Member: ver}).Err(); err != nil {
 		return err
+	}
+	if p.searchOn() {
+		if err := p.pointAlias(ctx, ver); err != nil {
+			return err
+		}
 	}
 	// The switch: from here on readers use the new version.
 	if err := p.rdb.Set(ctx, p.key("actual"), ver, 0).Err(); err != nil {
@@ -128,6 +151,10 @@ func (p *Publisher) prune(ctx context.Context, current string) error {
 }
 
 func (p *Publisher) deleteVersion(ctx context.Context, ver string) error {
+	// The index goes first: deleting the documents of a live index would update it one by one.
+	if err := p.dropIndex(ctx, ver); err != nil {
+		return err
+	}
 	var cursor uint64
 	for {
 		keys, next, err := p.rdb.Scan(ctx, cursor, p.key(ver, "*"), 1000).Result()

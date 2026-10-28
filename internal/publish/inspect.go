@@ -26,6 +26,8 @@ type Report struct {
 	Meta       map[string]string // <prefix>:<current>:meta
 	Rows       int64             // entries in <prefix>:<current>:filas
 	Indexes    map[string]int    // indexed field -> number of lookup sets
+	SearchOn   bool              // full-text search is configured
+	SearchDocs int64             // documents in the search index of the current version
 	SampleKey  string
 	SampleJSON string
 	Versions   []VersionInfo // newest first
@@ -94,6 +96,21 @@ func (p *Publisher) Inspect(ctx context.Context) (Report, error) {
 
 	if err := p.countIndexes(ctx, ver, r.Indexes); err != nil {
 		return r, err
+	}
+	if p.searchOn() {
+		r.SearchOn = true
+		info, err := p.rdb.FTInfo(ctx, p.indexName(ver)).Result()
+		switch {
+		case err != nil && isNoSearch(err):
+			r.Problems = append(r.Problems, fmt.Sprintf("search is configured but index %s does not exist", p.indexName(ver)))
+		case err != nil:
+			return r, err
+		default:
+			r.SearchDocs = int64(info.NumDocs)
+			if r.SearchDocs != r.Rows {
+				r.Problems = append(r.Problems, fmt.Sprintf("search index %s holds %d documents but there are %d rows", p.indexName(ver), r.SearchDocs, r.Rows))
+			}
+		}
 	}
 	if r.SampleKey, r.SampleJSON, err = p.sampleRow(ctx, ver); err != nil {
 		return r, err
@@ -165,6 +182,9 @@ func (r Report) Write(w io.Writer) {
 		}
 		for _, f := range fields {
 			fmt.Fprintf(w, "  %-21s %d\n", "idx."+f, r.Indexes[f])
+		}
+		if r.SearchOn {
+			fmt.Fprintf(w, "  %-21s %d\n", "search documents", r.SearchDocs)
 		}
 		if r.SampleKey != "" {
 			js := r.SampleJSON
