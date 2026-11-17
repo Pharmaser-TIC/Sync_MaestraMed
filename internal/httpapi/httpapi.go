@@ -31,10 +31,12 @@ const (
 
 	defaultInFlight = 64
 	requestTimeout  = 20 * time.Second // Redis calls of a request are cancelled after this
+	healthTimeout   = 2 * time.Second
 )
 
 // Source is the read side of Redis; *publish.Publisher implements it.
 type Source interface {
+	Ping(ctx context.Context) error
 	Current(ctx context.Context) (string, error)
 	Meta(ctx context.Context) (publish.Meta, error)
 	ChangesEnd(ctx context.Context) (string, error)
@@ -99,7 +101,12 @@ func New(src Source, opt Options) (http.Handler, error) {
 	mux.HandleFunc("GET /v1/productos", s.productos)
 	mux.HandleFunc("GET /v1/productos/{id}", s.producto)
 	mux.HandleFunc("GET /v1/cambios", s.cambios)
-	return s.auth(s.limit(mux)), nil
+	// /healthz is the only route without a key. It reports whether Redis answers and nothing else, and
+	// the reverse proxy does not forward it (only /v1/ is exposed).
+	root := http.NewServeMux()
+	root.HandleFunc("GET /healthz", s.healthz)
+	root.Handle("/", s.auth(s.limit(mux)))
+	return root, nil
 }
 
 func set(xs []string) map[string]bool {
@@ -291,6 +298,21 @@ func (s *server) views(c Consumer, rows []publish.Raw) ([]json.RawMessage, error
 }
 
 // --- handlers ----------------------------------------------------------------------------
+
+// healthz is for monitors on the same host: 200 when Redis answers, 503 otherwise. It takes no request
+// slot, so it still answers when the API is busy, and it logs only failures.
+func (s *server) healthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	ctx, cancel := context.WithTimeout(r.Context(), healthTimeout)
+	defer cancel()
+	if err := s.src.Ping(ctx); err != nil {
+		s.log.Warn("health check failed", "error", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
 
 func (s *server) version(w http.ResponseWriter, r *http.Request) {
 	m, err := s.src.Meta(r.Context())

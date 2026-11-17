@@ -51,6 +51,9 @@ type ChangeEvent struct {
 	Row      json.RawMessage
 }
 
+// Ping checks that Redis answers.
+func (p *Publisher) Ping(ctx context.Context) error { return p.rdb.Ping(ctx).Err() }
+
 // Meta returns the metadata of the version readers use now.
 func (p *Publisher) Meta(ctx context.Context) (Meta, error) {
 	ver, err := p.Current(ctx)
