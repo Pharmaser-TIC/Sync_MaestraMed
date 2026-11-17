@@ -271,6 +271,50 @@ loaded with `total` of `/v1/version` and reload on a mismatch.
   starting point: check `FT.SEARCH` and the stream commands work with it on your Redis before relying on it.
 - A project that can reach Redis should keep reading the stream directly: it is lighter than polling HTTP.
 
+### Exposing it with nginx (Docker + Let's Encrypt)
+
+`deploy/nginx/` runs nginx and certbot in Docker in front of the API: HTTPS on 443, the certificate from
+Let's Encrypt renewed automatically, and only `/v1/` forwarded to `127.0.0.1:8080`. The API itself keeps
+running as it is (for example under systemd).
+
+**Before you start**
+1. **DNS**: an A record for your domain pointing to the server's public IP.
+2. **Ports 80 and 443 reachable**: open them in the provider's firewall (for example the OCI security list of
+   the subnet) **and** in the host's (`sudo ufw allow 80,443/tcp`). Port 80 is needed for the certificate
+   validation and for renewals.
+3. **Ports 80 and 443 free on the server**: `sudo ss -ltnp | grep -E ':(80|443) '` must print nothing. If another
+   web server already uses them, add a virtual host there instead of using this stack.
+4. Docker with the compose plugin, and the API answering on `127.0.0.1:8080`.
+
+**Steps** (on the server, from this repository)
+```sh
+cd deploy/nginx
+cp env.example .env && nano .env      # API_DOMAIN and LETSENCRYPT_EMAIL
+./init-letsencrypt.sh --staging       # dry run against Let's Encrypt's test servers (no rate limits)
+./init-letsencrypt.sh --force         # the real certificate
+curl -i https://YOUR-DOMAIN/v1/version   # 401 without a key means nginx and the API are talking
+```
+Do the `--staging` run first: Let's Encrypt limits failed real attempts per hour. Afterwards:
+`docker compose logs -f nginx`, `docker compose ps`, `docker compose down` (the services restart by themselves
+after a reboot).
+
+**What it does**
+- Forwards only `/v1/*`, only `GET`/`HEAD`; everything else, `/healthz` included, is `404`. Plain HTTP is
+  redirected to HTTPS (and serves the validation challenge).
+- TLS 1.2/1.3, HTTP/2, HSTS (one year: once a client has seen it, it will only use HTTPS), no body accepted.
+- Rate limits: 20 requests/s per IP (burst 40) and 30 requests/s per API key (burst 60), 20 simultaneous
+  connections per IP; above that nginx answers `429`. A full load of the catalogue is a few dozen requests, so
+  normal use never gets near it.
+- nginx runs with the host network so it can reach the API on the host's loopback and bind 80/443.
+- Certificates and challenge files live in `deploy/nginx/data/` (not in git): back it up. nginx reloads every
+  6 hours to pick up renewed certificates; certbot tries to renew twice a day.
+- The monitor for the API stays local: `curl http://127.0.0.1:8080/healthz` on the server.
+
+The configuration was checked with `nginx -t` and a container with a stand-in upstream (proxy, 404s, method
+restriction, redirect, rate limit, body limit and challenge path). Issuing the certificate needs a real
+domain and open ports, so `init-letsencrypt.sh` has only been checked up to its validations: do the
+`--staging` run first.
+
 ## Checking what Redis holds
 
 `nt-sync -check` connects to the Redis configured in the environment / `.env`, prints what a cycle stored
