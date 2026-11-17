@@ -48,6 +48,10 @@ func (p *Publisher) ChangesStream() string { return p.key("cambios") }
 
 func (p *Publisher) changesOn() bool { return p.changesMax > 0 }
 
+// changesTotalKey counts every entry ever added to the stream. Trimming removes entries but never
+// lowers it, so "total > stream length" tells readers that history was lost.
+func (p *Publisher) changesTotalKey() string { return p.key("cambios", "total") }
+
 type change struct {
 	kind, id, fila string
 	campos, antes  string
@@ -68,7 +72,7 @@ func (p *Publisher) emitChanges(ctx context.Context, prev, ver string, rows []mo
 	}
 	for start := 0; start < len(changes); start += batchSize {
 		end := min(start+batchSize, len(changes))
-		pipe := p.rdb.Pipeline()
+		pipe := p.rdb.TxPipeline() // the entries and the counter are written together or not at all
 		for _, c := range changes[start:end] {
 			values := []any{"tipo", c.kind, "id", c.id, "version", ver, "anterior", prev, "fila", c.fila}
 			if c.kind == kindModified {
@@ -76,6 +80,7 @@ func (p *Publisher) emitChanges(ctx context.Context, prev, ver string, rows []mo
 			}
 			pipe.XAdd(ctx, &redis.XAddArgs{Stream: p.ChangesStream(), MaxLen: p.changesMax, Approx: true, Values: values})
 		}
+		pipe.IncrBy(ctx, p.changesTotalKey(), int64(end-start))
 		if _, err := pipe.Exec(ctx); err != nil {
 			return fmt.Errorf("writing changes %d-%d: %w", start, end, err)
 		}

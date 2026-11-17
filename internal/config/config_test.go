@@ -61,6 +61,33 @@ func TestChangesMaxLenDefaultsParsesAndRejectsBadValues(t *testing.T) {
 	}
 }
 
+func TestHTTPSettingsDefaultToLoopbackAndTheDocumentedPriceField(t *testing.T) {
+	base := map[string]string{"NT_API_URL": "https://h/api.php", "NT_API_KEY": "k", "REDIS_ADDR": "r:6379"}
+	c, err := Load(env(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.HTTP.Addr != "127.0.0.1:8080" || c.HTTP.ConsumersFile != "consumers.json" || len(c.HTTP.PriceFields) != 1 || c.HTTP.PriceFields[0] != "precio_venta" {
+		t.Errorf("defaults = %+v", c.HTTP)
+	}
+	base["NT_HTTP_ADDR"] = ":9000"
+	base["NT_CONSUMERS_FILE"] = "/etc/nt/consumers.json"
+	base["NT_PRICE_FIELDS"] = " precio_venta, precio_compra ,,iva"
+	if c, err = Load(env(base)); err != nil {
+		t.Fatal(err)
+	}
+	if c.HTTP.Addr != ":9000" || c.HTTP.ConsumersFile != "/etc/nt/consumers.json" || len(c.HTTP.PriceFields) != 3 || c.HTTP.PriceFields[2] != "iva" {
+		t.Errorf("parsed = %+v", c.HTTP)
+	}
+}
+
+func TestPriceFieldsRejectNamesThatAreNotPlainKeys(t *testing.T) {
+	_, err := Load(env(map[string]string{"NT_API_URL": "https://h/api.php", "NT_API_KEY": "k", "REDIS_ADDR": "r:6379", "NT_PRICE_FIELDS": "precio_venta,a.b"}))
+	if err == nil || !strings.Contains(err.Error(), "NT_PRICE_FIELDS") {
+		t.Fatalf("expected an NT_PRICE_FIELDS error, got %v", err)
+	}
+}
+
 func TestLoadReportsEveryProblem(t *testing.T) {
 	_, err := Load(env(map[string]string{"POLL_INTERVAL": "soon", "REDIS_KEEP_VERSIONS": "0"}))
 	if err == nil {

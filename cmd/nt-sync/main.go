@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 
 	"nt-sync/internal/api"
 	"nt-sync/internal/config"
+	"nt-sync/internal/httpapi"
 	"nt-sync/internal/publish"
 	"nt-sync/internal/store"
 	"nt-sync/internal/syncer"
@@ -28,6 +30,7 @@ func main() {
 	envFile := flag.String("env", ".env", "file with KEY=VALUE settings; variables already set in the environment win; a missing file is ignored")
 	debug := flag.Bool("debug", false, "log every cycle, including the ones without changes")
 	check := flag.Bool("check", false, "read back what is stored in Redis, print a report and exit (1 when something is wrong); does not call the API")
+	serve := flag.Bool("serve", false, "serve the products over a read-only HTTP API (see NT_HTTP_ADDR, NT_CONSUMERS_FILE, NT_PRICE_FIELDS); does not call the upstream API or synchronize")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -43,7 +46,11 @@ func main() {
 	}
 	log.Debug("settings file", "path", *envFile, "loaded", loaded)
 
-	if err := run(log, *once, *check); err != nil {
+	if *serve && (*once || *check) {
+		log.Error("fatal", "error", "-serve cannot be combined with -once or -check")
+		os.Exit(1)
+	}
+	if err := run(log, *once, *check, *serve); err != nil {
 		log.Error("fatal", "error", err)
 		os.Exit(1)
 	}
@@ -76,7 +83,29 @@ func checkRedis(ctx context.Context, rdb *redis.Client, cfg config.Redis, search
 	return nil
 }
 
-func run(log *slog.Logger, once, check bool) error {
+// serveHTTP runs the read-only API. It never writes to Redis, so it can use a Redis user with read
+// commands only, and it does not need the upstream API, the SQLite copy or the sync lock.
+func serveHTTP(ctx context.Context, log *slog.Logger, cfg config.Config, pub *publish.Publisher) error {
+	consumers, err := httpapi.LoadConsumers(cfg.HTTP.ConsumersFile)
+	if err != nil {
+		return err
+	}
+	h, err := httpapi.New(pub, httpapi.Options{
+		Consumers:    consumers,
+		PriceFields:  cfg.HTTP.PriceFields,
+		IndexFields:  cfg.IndexFields,
+		SearchFields: cfg.SearchFields,
+		Log:          log,
+	})
+	if err != nil {
+		return err
+	}
+	log.Info("serving", "consumers", len(consumers), "redis", cfg.Redis.Addr, "prefix", cfg.Redis.Prefix,
+		"hidden_without_prices", strings.Join(cfg.HTTP.PriceFields, ","))
+	return httpapi.Serve(ctx, cfg.HTTP.Addr, h, log)
+}
+
+func run(log *slog.Logger, once, check, serve bool) error {
 	cfg, err := config.FromEnv()
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
@@ -91,6 +120,9 @@ func run(log *slog.Logger, once, check bool) error {
 		return fmt.Errorf("connecting to redis: %w", err)
 	}
 	pub := publish.New(rdb, cfg.Redis.Prefix, cfg.Redis.Keep).WithSearch(cfg.SearchFields).WithChanges(cfg.Redis.ChangesMaxLen)
+	if serve {
+		return serveHTTP(ctx, log, cfg, pub)
+	}
 	if len(cfg.SearchFields) > 0 {
 		if err := pub.CheckSearch(ctx); err != nil {
 			return err

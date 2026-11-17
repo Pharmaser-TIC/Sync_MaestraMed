@@ -19,6 +19,14 @@ type Config struct {
 	SQLitePath   string
 	IndexFields  []string // snapshot fields that get a lookup set in Redis
 	SearchFields []string // snapshot fields indexed as full-text in RediSearch; empty disables search
+	HTTP         HTTP
+}
+
+// HTTP groups the settings of the read-only HTTP API (nt-sync -serve).
+type HTTP struct {
+	Addr          string   // listen address; loopback by default, TLS and exposure belong to the reverse proxy
+	ConsumersFile string   // JSON file with the projects allowed to call the API
+	PriceFields   []string // row fields hidden from the consumers that may not see prices
 }
 
 // Redis groups the Redis connection settings.
@@ -91,6 +99,18 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			continue
 		}
 		c.SearchFields = append(c.SearchFields, f)
+	}
+	c.HTTP.Addr = get("NT_HTTP_ADDR", "127.0.0.1:8080")
+	c.HTTP.ConsumersFile = get("NT_CONSUMERS_FILE", "consumers.json")
+	for _, f := range strings.Split(get("NT_PRICE_FIELDS", "precio_venta"), ",") {
+		if f = strings.TrimSpace(f); f == "" {
+			continue
+		}
+		if !validFieldName(f) {
+			errs = append(errs, fmt.Errorf("NT_PRICE_FIELDS: %q is not a valid field name (letters, digits and _ only)", f))
+			continue
+		}
+		c.HTTP.PriceFields = append(c.HTTP.PriceFields, f)
 	}
 	if len(errs) > 0 {
 		return Config{}, errors.Join(errs...)

@@ -1,0 +1,14 @@
+{
+  "consumers": [
+    {
+      "name": "facturacion",
+      "key_sha256": "REPLACE_WITH_SHA256_OF_THE_PROJECT_KEY_64_HEX",
+      "precios": true
+    },
+    {
+      "name": "inventario",
+      "key_sha256": "REPLACE_WITH_SHA256_OF_THE_PROJECT_KEY_64_HEX",
+      "precios": false
+    }
+  ]
+}
