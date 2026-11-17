@@ -132,6 +132,14 @@ func (p *Publisher) Publish(ctx context.Context, snap model.Snapshot, rows []mod
 		if err := p.emitChanges(ctx, prev, ver, rows); err != nil {
 			return fmt.Errorf("writing change stream: %w", err)
 		}
+		// Readers that load this version continue from here (see Meta.ChangesUpTo).
+		end, err := p.ChangesEnd(ctx)
+		if err != nil {
+			return err
+		}
+		if err := p.rdb.HSet(ctx, p.key(ver, "meta"), "cambios_hasta", end).Err(); err != nil {
+			return fmt.Errorf("writing change cursor: %w", err)
+		}
 	}
 	if p.searchOn() {
 		if err := p.pointAlias(ctx, ver); err != nil {

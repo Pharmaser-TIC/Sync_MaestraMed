@@ -41,6 +41,7 @@ Docker: `docker build -t nt-sync .` and run it with the same variables and a vol
 | `REDIS_KEEP_VERSIONS` | `2` | Versions kept in Redis (current + previous ones) |
 | `POLL_INTERVAL` | `30s` | Time between `nt_version` checks (30-60 s recommended) |
 | `SQLITE_PATH` | `data/nt.db` | Local copy |
+| `NT_HTTP_ADDR`, `NT_CONSUMERS_FILE`, `NT_PRICE_FIELDS` | `127.0.0.1:8080`, `consumers.json`, `precio_venta` | Only for `nt-sync -serve` (see "HTTP API") |
 | `NT_CHANGES_MAXLEN` | `100000` | Entries kept in the `nt:cambios` change stream (see "Change stream"); `0` turns it off |
 | `NT_INDEX_FIELDS` | `cum_facturar,cod_auf,cod_mutual,estado,contrato` | Fields that get a lookup set |
 | `NT_SEARCH_FIELDS` | empty (search off) | Fields indexed for full-text search, e.g. `descripcion,descripcion_siesa`; needs Redis 8 or Redis Stack (see "Full-text search") |
@@ -173,6 +174,96 @@ reports how many documents the search index of the current version holds.
 A new version is written completely under its own prefix and only then does `nt:actual` change, so a
 reader that resolved the pointer once always sees a consistent snapshot. The previous version stays
 for the next cycle (`REDIS_KEEP_VERSIONS`); do not cache the version for longer than a few seconds.
+
+## HTTP API for projects without Redis access
+
+`nt-sync -serve` exposes the same data over HTTP, read-only, for projects that cannot reach Redis. It is a
+separate process from the sync (run it as its own service): it does not call the upstream API, does not touch
+SQLite and never writes to Redis. It reads the same `.env`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `NT_HTTP_ADDR` | `127.0.0.1:8080` | Listen address. Loopback by default: publish it through a reverse proxy with TLS |
+| `NT_CONSUMERS_FILE` | `consumers.json` | Projects allowed to call the API (see below). The server refuses to start without it |
+| `NT_PRICE_FIELDS` | `precio_venta` | Row fields hidden from the projects that may not see prices |
+
+### Who can call it, and who sees prices
+
+Every request needs `X-API-Key`. Each project has its own key, and `consumers.json` lists the projects with the
+**SHA-256 of their key** (never the key) and whether they may see prices. Copy `consumers.example.json`:
+
+```sh
+KEY=$(openssl rand -hex 32)                      # give this to the project, once
+printf %s "$KEY" | sha256sum | cut -d' ' -f1     # put this in "key_sha256"
+```
+
+```json
+{"consumers":[
+  {"name":"facturacion","key_sha256":"<64 hex>","precios":true},
+  {"name":"inventario","key_sha256":"<64 hex>","precios":false}
+]}
+```
+
+- `"precios"` has no default: a consumer without it, a typo in a field name, a duplicated name or key, or a key
+  that is not 64 hex characters stops the server from starting. Revoke a project by removing its entry and
+  restarting.
+- A project with `"precios": false` receives every product **without the fields in `NT_PRICE_FIELDS`**, in
+  every endpoint, including `antes`/`fila`/`campos` of the changes. An update that only touched prices is not
+  delivered to it, and it cannot filter or search by a price field (403).
+- It is a deny list: field names are matched ignoring case, and also inside nested objects and arrays, but
+  **a new price column with another name is visible until you add it to `NT_PRICE_FIELDS`**. Check the list against a full row (`nt-sync -check` prints a sample) whenever the
+  Maestra gets new columns. The server refuses to start if someone cannot see prices and the list is empty.
+- Keys do not expire. Rotate by issuing a new key and replacing the hash.
+
+### Endpoints
+
+| Request | Answer |
+|---|---|
+| `GET /v1/version` | `version`, `generado_en`, `publicado_en`, `total`, `ultimo_cambio` |
+| `GET /v1/productos?limit=500&cursor=` | every product with all its columns, in pages. Follow `siguiente` until it is empty |
+| `GET /v1/productos/{id}` | one product (row key; `#` travels as `%23`, e.g. `/v1/productos/3%232`) |
+| `GET /v1/productos?cum_facturar=123456-1` | exact filter on a field of `NT_INDEX_FIELDS` (one at a time; trimmed, case-insensitive). `offset` (up to 100000) and `limit` to page, `total` in the answer |
+| `GET /v1/productos?q=levo` | text search over `NT_SEARCH_FIELDS` (accents ignored, contains, words of 2+ letters, up to 6; AND). `501` when search is off |
+| `GET /v1/cambios?desde=<id>&limit=500` | changes after that stream id: `eventos`, `siguiente`, `hay_mas` |
+
+A paged read keeps reading the version it started on (the cursor carries it), even if a new one is published
+in the middle; if that version was already removed the answer is `410`: start again without a cursor.
+
+**Staying up to date** (same idea as the Redis stream, with a cursor held by the client instead of a consumer group):
+
+1. `GET /v1/version` and keep `ultimo_cambio`: the stream position that goes with that `version` (`0-0` when
+   there are no changes yet). Do not take it from anywhere else.
+2. Load every product (`/v1/productos`, following `siguiente`).
+3. Loop: `GET /v1/cambios?desde=<cursor>`; apply each event (`creado`/`modificado`: store `fila` by `id`;
+   `eliminado`: delete `id`); keep `siguiente` as the new cursor; while `hay_mas` is true ask again right away,
+   otherwise wait a few seconds. Applying an event twice is harmless.
+4. `410` with `"perdido": true` means the stream was trimmed past your cursor (this includes `0-0` once the
+   stream has been trimmed at all): go back to step 1.
+
+Errors are JSON (`{"error": "..."}`): `400` bad parameter, `401` missing or unknown key, `403` price field not
+allowed, `404` no such product, `410` start again, `501` search off, `503` nothing published, search unavailable
+or too many requests in progress (retry after a second).
+
+Limits: 64 requests are served at the same time (the rest get `503`), every request has a 20 s deadline, a page
+holds at most 1000 products, `q` at most 100 characters. A consumer without prices can see that a publication
+happened (`hay_mas` or a moving `siguiente`) even when its changes were only price updates. If Redis restarts or
+fails over in the middle of a paged read, the cursor may skip or repeat rows: compare the number of products you
+loaded with `total` of `/v1/version` and reload on a mismatch.
+
+### Running it
+
+```sh
+./nt-sync -serve        # listens on NT_HTTP_ADDR, logs one line per request (consumer, path, status; never the key)
+```
+
+- **Expose it only through a reverse proxy with TLS** (nginx, Caddy) and add rate limiting there; the server
+  itself speaks plain HTTP. Keep it on loopback unless the proxy runs elsewhere.
+- Run it as a service (systemd) so it restarts: `ExecStart=/opt/nt-sync/nt-sync -serve`,
+  `WorkingDirectory=/opt/nt-sync`, `Restart=always`, a non-root `User=`.
+- **Use a Redis user with read commands only** for this process (its own `.env`), for example
+  `ACL SETUSER nt-api on >password ~nt:* resetchannels -@all +@read +ping +hello +client|setinfo`. This ACL is a
+  starting point: check `FT.SEARCH` and the stream commands work with it on your Redis before relying on it.
+- A project that can reach Redis should keep reading the stream directly: it is lighter than polling HTTP.
 
 ## Checking what Redis holds
 
