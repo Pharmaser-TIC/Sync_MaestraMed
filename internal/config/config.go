@@ -29,6 +29,8 @@ type Redis struct {
 	TLS      bool
 	Prefix   string // namespace of every key
 	Keep     int    // published versions kept in Redis (the current one plus the previous ones)
+
+	ChangesMaxLen int64 // entries kept in the <prefix>:cambios stream; 0 turns the change stream off
 }
 
 // Load builds a Config from the given lookup function (os.LookupEnv in production).
@@ -71,6 +73,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if c.Redis.Keep, err = strconv.Atoi(get("REDIS_KEEP_VERSIONS", "2")); err != nil || c.Redis.Keep < 1 {
 		errs = append(errs, errors.New("REDIS_KEEP_VERSIONS must be an integer of at least 1"))
+	}
+	if c.Redis.ChangesMaxLen, err = strconv.ParseInt(get("NT_CHANGES_MAXLEN", "100000"), 10, 64); err != nil || c.Redis.ChangesMaxLen < 0 {
+		errs = append(errs, errors.New("NT_CHANGES_MAXLEN must be a non-negative integer (0 turns the change stream off)"))
 	}
 	for _, f := range strings.Split(get("NT_INDEX_FIELDS", "cum_facturar,cod_auf,cod_mutual,estado,contrato"), ",") {
 		if f = strings.TrimSpace(f); f != "" {
