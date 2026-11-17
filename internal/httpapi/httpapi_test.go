@@ -733,3 +733,68 @@ func TestTooManyRequestsInFlightAreRefused(t *testing.T) {
 		t.Errorf("the slot must be free again, got %d", code)
 	}
 }
+
+// --- /healthz -----------------------------------------------------------------------------
+
+func TestHealthzNeedsNoKeyAndExposesNothingButTheStatus(t *testing.T) {
+	e := newEnv(t, envOpts{}) // nothing published: the process and Redis are fine, that is all it reports
+	code, raw := e.getRaw(t, "/healthz", "")
+	if code != http.StatusOK || strings.TrimSpace(raw) != `{"status":"ok"}` {
+		t.Fatalf("%d %q", code, raw)
+	}
+	req, _ := http.NewRequest(http.MethodGet, e.srv.URL+"/healthz", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.Header.Get("Cache-Control") != "no-store" || !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+		t.Errorf("headers = %v", resp.Header)
+	}
+	// being open does not open anything else
+	if code, _ := e.get(t, "/v1/version", ""); code != http.StatusUnauthorized {
+		t.Errorf("/v1/version without a key: %d, want 401", code)
+	}
+	if code, _ := e.get(t, "/healthz/extra", ""); code != http.StatusUnauthorized {
+		t.Errorf("only /healthz itself is public: %d", code)
+	}
+}
+
+func TestHealthzReportsRedisDownWithoutLeakingTheError(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.mr.Close()
+	code, raw := e.getRaw(t, "/healthz", "")
+	if code != http.StatusServiceUnavailable || strings.TrimSpace(raw) != `{"status":"unavailable"}` {
+		t.Fatalf("%d %q", code, raw)
+	}
+}
+
+func TestHealthzDoesNotTakeARequestSlot(t *testing.T) {
+	g := &gate{started: make(chan struct{}, 4), release: make(chan struct{})}
+	e := newEnv(t, envOpts{maxInFlight: 1, wrap: func(s Source) Source { g.Source = s; return g }})
+	e.publish(t, "v1", baseRows...)
+
+	first := make(chan int, 1)
+	go func() { code, _ := e.get(t, "/v1/version", keyFull); first <- code }()
+	<-g.started // the only slot is taken
+
+	if code, _ := e.getRaw(t, "/healthz", ""); code != http.StatusOK {
+		t.Errorf("a monitor must still get an answer when the API is busy: %d", code)
+	}
+	close(g.release)
+	<-first
+}
+
+func TestHealthzIsNotAShortcutIntoTheAuthenticatedRoutes(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.publish(t, "v1", baseRows...)
+	for _, path := range []string{
+		"/healthz/", "/HEALTHZ", "/healthz/../v1/version", "/healthz/%2e%2e/v1/version",
+		"/healthz%2f..%2fv1%2fversion", "/healthz/../v1/productos", "//v1/version", "/./v1/version",
+	} {
+		code, raw := e.getRaw(t, path, "")
+		if strings.Contains(raw, `"version":"v1"`) || strings.Contains(raw, "productos") || strings.Contains(raw, "LEVOFLOXACINO") {
+			t.Errorf("%s leaked data without a key (status %d): %s", path, code, raw)
+		}
+	}
+}

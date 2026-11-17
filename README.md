@@ -244,6 +244,12 @@ Errors are JSON (`{"error": "..."}`): `400` bad parameter, `401` missing or unkn
 allowed, `404` no such product, `410` start again, `501` search off, `503` nothing published, search unavailable
 or too many requests in progress (retry after a second).
 
+`GET /healthz` is the health check for monitors on the same host: no key, `200 {"status":"ok"}` when Redis
+answers, `503 {"status":"unavailable"}` when it does not. It says nothing else (not even whether data is
+published; use `/v1/version` with a key for that), takes no request slot and is not logged unless it fails. The
+nginx setup does not forward it (only `/v1/` is exposed); if you open `NT_HTTP_ADDR` beyond loopback without a
+proxy, it becomes public.
+
 Limits: 64 requests are served at the same time (the rest get `503`), every request has a 20 s deadline, a page
 holds at most 1000 products, `q` at most 100 characters. A consumer without prices can see that a publication
 happened (`hay_mas` or a moving `siguiente`) even when its changes were only price updates. If Redis restarts or
