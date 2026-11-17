@@ -57,6 +57,16 @@ type change struct {
 	campos, antes  string
 }
 
+// seedChangesCounter makes the counter at least the stream length the first time it is needed:
+// entries written by a binary that did not keep the counter must count as history that can be trimmed.
+func (p *Publisher) seedChangesCounter(ctx context.Context) error {
+	n, err := p.rdb.XLen(ctx, p.ChangesStream()).Result()
+	if err != nil || n == 0 {
+		return err
+	}
+	return p.rdb.SetNX(ctx, p.changesTotalKey(), n, 0).Err()
+}
+
 // emitChanges appends the differences between version prev and rows (the content of ver).
 func (p *Publisher) emitChanges(ctx context.Context, prev, ver string, rows []model.Row) error {
 	if prev == "" || prev == ver {
