@@ -43,6 +43,24 @@ func TestSearchFieldsRejectNamesThatAreNotPlainKeys(t *testing.T) {
 	}
 }
 
+func TestChangesMaxLenDefaultsParsesAndRejectsBadValues(t *testing.T) {
+	base := map[string]string{"NT_API_URL": "https://h/api.php", "NT_API_KEY": "k", "REDIS_ADDR": "r:6379"}
+	c, err := Load(env(base))
+	if err != nil || c.Redis.ChangesMaxLen != 100000 {
+		t.Fatalf("default: %d, %v", c.Redis.ChangesMaxLen, err)
+	}
+	base["NT_CHANGES_MAXLEN"] = "0"
+	if c, err = Load(env(base)); err != nil || c.Redis.ChangesMaxLen != 0 {
+		t.Fatalf("zero: %d, %v", c.Redis.ChangesMaxLen, err)
+	}
+	for _, bad := range []string{"-1", "many"} {
+		base["NT_CHANGES_MAXLEN"] = bad
+		if _, err := Load(env(base)); err == nil || !strings.Contains(err.Error(), "NT_CHANGES_MAXLEN") {
+			t.Errorf("%q: expected an NT_CHANGES_MAXLEN error, got %v", bad, err)
+		}
+	}
+}
+
 func TestLoadReportsEveryProblem(t *testing.T) {
 	_, err := Load(env(map[string]string{"POLL_INTERVAL": "soon", "REDIS_KEEP_VERSIONS": "0"}))
 	if err == nil {

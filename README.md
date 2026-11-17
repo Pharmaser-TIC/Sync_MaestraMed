@@ -41,6 +41,7 @@ Docker: `docker build -t nt-sync .` and run it with the same variables and a vol
 | `REDIS_KEEP_VERSIONS` | `2` | Versions kept in Redis (current + previous ones) |
 | `POLL_INTERVAL` | `30s` | Time between `nt_version` checks (30-60 s recommended) |
 | `SQLITE_PATH` | `data/nt.db` | Local copy |
+| `NT_CHANGES_MAXLEN` | `100000` | Entries kept in the `nt:cambios` change stream (see "Change stream"); `0` turns it off |
 | `NT_INDEX_FIELDS` | `cum_facturar,cod_auf,cod_mutual,estado,contrato` | Fields that get a lookup set |
 | `NT_SEARCH_FIELDS` | empty (search off) | Fields indexed for full-text search, e.g. `descripcion,descripcion_siesa`; needs Redis 8 or Redis Stack (see "Full-text search") |
 
@@ -92,6 +93,58 @@ redis-cli SMEMBERS "nt:$V:idx:cum_facturar:123456-1"      # row keys
 redis-cli HMGET "nt:$V:filas" 17 18                       # the rows
 redis-cli HGET "nt:$V:meta" con_precios
 ```
+
+### Reading every product
+
+`nt:<version>:filas` holds every product: one field per row key, whose value is the row JSON with all
+its columns. Page through it with `HSCAN` (do not use `HGETALL` on a big version: it blocks Redis):
+
+```sh
+V=$(redis-cli GET nt:actual)
+redis-cli HSCAN "nt:$V:filas" 0 COUNT 500      # repeat with the returned cursor until it is 0
+redis-cli HLEN "nt:$V:filas"                   # how many products
+```
+
+Resolve `nt:actual` once per full read and keep using that version until you finish: a new version can be
+published in the middle, and the previous one stays readable (see `REDIS_KEEP_VERSIONS`).
+
+## Change stream
+
+To know **which product changed** (and update the databases that use it) read the Redis Stream
+`nt:cambios`. On every publication nt-sync compares the new rows with the ones readers had and adds one
+entry per row that was created, modified or deleted:
+
+| Field | Content |
+|---|---|
+| `tipo` | `creado`, `modificado` or `eliminado` |
+| `id` | row key (the row `id`; `id#2`, `id#3`... when a line has several PLU) |
+| `version` | version that introduced the change |
+| `anterior` | version it was compared with |
+| `campos` | `modificado` only: changed fields, comma separated |
+| `antes` | `modificado` only: JSON with the previous value of each changed field (`null` if it did not exist) |
+| `fila` | the row as published (for `eliminado`, as it was) |
+
+Each database reads with its own consumer group, so it receives every event once it asks, even if it was
+down for a while, and the others are not affected:
+
+```sh
+redis-cli XGROUP CREATE nt:cambios mi_base '$' MKSTREAM    # once per consumer; '$' = only new changes ('0' = everything kept)
+redis-cli XREADGROUP GROUP mi_base worker1 COUNT 100 BLOCK 5000 STREAMS nt:cambios '>'
+redis-cli XACK nt:cambios mi_base <entry-id>               # after the change was applied
+```
+
+- **Delivery is at-least-once.** Entries are written before `nt:actual` switches; if a publication fails
+  and is retried they can be written twice. Make the update idempotent (the row JSON in `fila` replaces the
+  record) or dedupe by `(version, id)`.
+- A consumer that crashes before `XACK` gets its pending entries back with `XAUTOCLAIM` / `XPENDING`.
+- **The first publication emits nothing**, and neither does one made after Redis lost the previous version's
+  rows: there is nothing to compare with. A new consumer should load everything once (previous section) and then
+  follow the stream.
+- Rows that differ only in the order of their JSON keys are not changes.
+- The stream keeps about `NT_CHANGES_MAXLEN` entries (default 100000; `0` turns it off). A consumer that stays
+  away longer than that loses the oldest entries: reload everything if `XINFO GROUPS` shows it lagging past the
+  trimmed range. A massive change (for example a full price update) writes one entry per row.
+- `nt-sync -check` prints the stream length and its newest entry.
 
 ## Full-text search
 

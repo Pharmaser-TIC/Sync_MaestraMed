@@ -37,6 +37,8 @@ type Publisher struct {
 	prefix string
 	keep   int
 	search []string // fields indexed for full-text search; empty means search is off
+
+	changesMax int64 // approximate length of the change stream; 0 means it is off (see changes.go)
 }
 
 // New returns a Publisher that keeps the newest `keep` published versions (at least 1).
@@ -64,6 +66,14 @@ func (p *Publisher) Publish(ctx context.Context, snap model.Snapshot, rows []mod
 	ver := snap.Version
 	if ver == "" {
 		return fmt.Errorf("snapshot without version")
+	}
+	// The version readers use now is the baseline of the change stream.
+	prev := ""
+	if p.changesOn() {
+		var err error
+		if prev, err = p.Current(ctx); err != nil {
+			return err
+		}
 	}
 	// A previous attempt may have left a partial copy of this same version.
 	if err := p.deleteVersion(ctx, ver); err != nil {
@@ -117,6 +127,11 @@ func (p *Publisher) Publish(ctx context.Context, snap model.Snapshot, rows []mod
 	}
 	if err := p.rdb.ZAdd(ctx, p.key("versiones"), redis.Z{Score: float64(now.UnixNano()), Member: ver}).Err(); err != nil {
 		return err
+	}
+	if p.changesOn() {
+		if err := p.emitChanges(ctx, prev, ver, rows); err != nil {
+			return fmt.Errorf("writing change stream: %w", err)
+		}
 	}
 	if p.searchOn() {
 		if err := p.pointAlias(ctx, ver); err != nil {

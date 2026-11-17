@@ -30,6 +30,9 @@ type Report struct {
 	SearchDocs int64             // documents in the search index of the current version
 	SampleKey  string
 	SampleJSON string
+	ChangesOn  bool          // the change stream is configured
+	ChangesLen int64         // entries in <prefix>:cambios
+	ChangesEnd string        // id of the newest entry, "" when empty
 	Versions   []VersionInfo // newest first
 	LockHeld   bool
 	LockTTL    time.Duration
@@ -68,6 +71,18 @@ func (p *Publisher) Inspect(ctx context.Context) (Report, error) {
 		r.LockHeld = true
 		if ttl, err := p.rdb.PTTL(ctx, p.key("lock")).Result(); err == nil && ttl > 0 {
 			r.LockTTL = ttl
+		}
+	}
+
+	if p.changesOn() {
+		r.ChangesOn = true
+		if r.ChangesLen, err = p.rdb.XLen(ctx, p.ChangesStream()).Result(); err != nil {
+			return r, err
+		}
+		if last, err := p.rdb.XRevRangeN(ctx, p.ChangesStream(), "+", "-", 1).Result(); err != nil {
+			return r, err
+		} else if len(last) == 1 {
+			r.ChangesEnd = last[0].ID
 		}
 	}
 
@@ -193,6 +208,14 @@ func (r Report) Write(w io.Writer) {
 			}
 			fmt.Fprintf(w, "  sample row %s: %s\n", r.SampleKey, js)
 		}
+	}
+
+	if r.ChangesOn {
+		last := r.ChangesEnd
+		if last == "" {
+			last = "(none)"
+		}
+		fmt.Fprintf(w, "\nChange stream %s: %d entries, newest %s\n", r.Prefix+":cambios", r.ChangesLen, last)
 	}
 
 	if len(r.Versions) > 0 {

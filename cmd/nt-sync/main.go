@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -49,7 +50,12 @@ func main() {
 }
 
 func newRedis(r config.Redis) *redis.Client {
-	opts := &redis.Options{Addr: r.Addr, Password: r.Password, DB: r.DB}
+	// Publishing sends pipelines of thousands of commands; the 3s go-redis default is too
+	// short over a VPN or a slow link and fails with "i/o timeout".
+	opts := &redis.Options{
+		Addr: r.Addr, Password: r.Password, DB: r.DB,
+		ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second,
+	}
 	if r.TLS {
 		opts.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	}
@@ -59,7 +65,7 @@ func newRedis(r config.Redis) *redis.Client {
 // checkRedis prints what is stored in Redis; it never writes and never touches SQLite or the API.
 func checkRedis(ctx context.Context, rdb *redis.Client, cfg config.Redis, searchFields []string) error {
 	fmt.Printf("Redis %s (db %d, tls %t), prefix %q: connection OK\n\n", cfg.Addr, cfg.DB, cfg.TLS, cfg.Prefix)
-	report, err := publish.New(rdb, cfg.Prefix, cfg.Keep).WithSearch(searchFields).Inspect(ctx)
+	report, err := publish.New(rdb, cfg.Prefix, cfg.Keep).WithSearch(searchFields).WithChanges(cfg.ChangesMaxLen).Inspect(ctx)
 	if err != nil {
 		return fmt.Errorf("reading redis: %w", err)
 	}
@@ -84,7 +90,7 @@ func run(log *slog.Logger, once, check bool) error {
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		return fmt.Errorf("connecting to redis: %w", err)
 	}
-	pub := publish.New(rdb, cfg.Redis.Prefix, cfg.Redis.Keep).WithSearch(cfg.SearchFields)
+	pub := publish.New(rdb, cfg.Redis.Prefix, cfg.Redis.Keep).WithSearch(cfg.SearchFields).WithChanges(cfg.Redis.ChangesMaxLen)
 	if len(cfg.SearchFields) > 0 {
 		if err := pub.CheckSearch(ctx); err != nil {
 			return err
