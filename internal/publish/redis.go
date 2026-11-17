@@ -129,6 +129,9 @@ func (p *Publisher) Publish(ctx context.Context, snap model.Snapshot, rows []mod
 		return err
 	}
 	if p.changesOn() {
+		if err := p.seedChangesCounter(ctx); err != nil {
+			return err
+		}
 		if err := p.emitChanges(ctx, prev, ver, rows); err != nil {
 			return fmt.Errorf("writing change stream: %w", err)
 		}
@@ -174,6 +177,10 @@ func (p *Publisher) prune(ctx context.Context, current string) error {
 }
 
 func (p *Publisher) deleteVersion(ctx context.Context, ver string) error {
+	// A version that is being rewritten must not stay listed as readable (see Page in read.go).
+	if err := p.rdb.ZRem(ctx, p.key("versiones"), ver).Err(); err != nil {
+		return err
+	}
 	// The index goes first: deleting the documents of a live index would update it one by one.
 	if err := p.dropIndex(ctx, ver); err != nil {
 		return err

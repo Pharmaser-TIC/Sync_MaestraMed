@@ -188,19 +188,20 @@ func (p *Publisher) ChangesEnd(ctx context.Context) (string, error) {
 func (p *Publisher) ChangesSince(ctx context.Context, after string, limit int) (events []ChangeEvent, hasMore, lost bool, err error) {
 	// The stream was trimmed when more entries were ever added than it holds now. Then everything
 	// older than its first entry is gone, so a cursor older than that missed some of it.
-	added, err := p.rdb.Get(ctx, p.changesTotalKey()).Int64()
+	// The three reads are one transaction: a publication trimming in between could otherwise
+	// make them disagree.
+	tx := p.rdb.TxPipeline()
+	addedCmd := tx.Get(ctx, p.changesTotalKey())
+	lengthCmd := tx.XLen(ctx, p.ChangesStream())
+	firstCmd := tx.XRangeN(ctx, p.ChangesStream(), "-", "+", 1)
+	if _, err := tx.Exec(ctx); err != nil && err != redis.Nil { // redis.Nil: no counter yet
+		return nil, false, false, err
+	}
+	added, err := addedCmd.Int64()
 	if err != nil && err != redis.Nil {
 		return nil, false, false, err
 	}
-	length, err := p.rdb.XLen(ctx, p.ChangesStream()).Result()
-	if err != nil {
-		return nil, false, false, err
-	}
-	if added > length {
-		first, err := p.rdb.XRangeN(ctx, p.ChangesStream(), "-", "+", 1).Result()
-		if err != nil {
-			return nil, false, false, err
-		}
+	if first := firstCmd.Val(); added > lengthCmd.Val() {
 		if len(first) == 0 || streamIDLess(after, first[0].ID) {
 			return nil, false, true, nil
 		}

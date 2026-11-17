@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // events returns the entries of the change stream, oldest first.
@@ -197,5 +199,33 @@ func TestInspectReportsTheChangeStream(t *testing.T) {
 	r.Write(&out)
 	if !strings.Contains(out.String(), "Change stream nt:cambios: 1 entries") {
 		t.Errorf("report text:\n%s", out.String())
+	}
+}
+
+func TestCounterIsSeededFromAStreamWrittenBeforeTheCounterExisted(t *testing.T) {
+	// an earlier binary appended entries without keeping nt:cambios:total
+	p, mr := setup(t, 2)
+	p.WithChanges(1000)
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if err := p.rdb.XAdd(ctx, &redis.XAddArgs{Stream: p.ChangesStream(), Values: []any{"tipo", "creado", "id", "x", "version", "v0", "anterior", "", "fila", "{}"}}).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	publishAll(t, p, "v1", `{"id":1,"a":"x"}`)
+	publishAll(t, p, "v2", `{"id":1,"a":"y"}`) // one more entry
+	if got, _ := mr.Get(p.changesTotalKey()); got != "3" {
+		t.Fatalf("total = %q, want 3 (2 existing + 1 new): otherwise trimming of old entries goes unnoticed", got)
+	}
+}
+
+func TestDeletingAVersionAlsoRemovesItFromTheVersionList(t *testing.T) {
+	p, mr := setup(t, 2)
+	publishAll(t, p, "v1", `{"id":1}`)
+	if err := p.deleteVersion(context.Background(), "v1"); err != nil {
+		t.Fatal(err)
+	}
+	if z, _ := mr.ZMembers("nt:versiones"); len(z) != 0 {
+		t.Fatalf("a version that is being rewritten must not stay listed as readable: %v", z)
 	}
 }
