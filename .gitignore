@@ -9,3 +9,5 @@
 /logs/
 .nt-sync.lock
 /consumers.json
+/deploy/nginx/.env
+/deploy/nginx/data/
