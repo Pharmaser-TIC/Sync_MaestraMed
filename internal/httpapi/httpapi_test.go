@@ -62,6 +62,8 @@ type envOpts struct {
 	changesMax   int64
 	maxInFlight  int
 	wrap         func(Source) Source
+	fields       []string // columns the API returns; nil returns every column
+	priceFields  []string // nil means precio_venta
 }
 
 func newEnv(t *testing.T, o envOpts) *env {
@@ -77,6 +79,10 @@ func newEnv(t *testing.T, o envOpts) *env {
 	}
 	p := publish.New(rdb, "nt", o.keep).WithChanges(o.changesMax)
 	fs := &fakeSearch{Publisher: p}
+	priceFields := o.priceFields
+	if priceFields == nil {
+		priceFields = []string{"precio_venta"}
+	}
 	var src Source = fs
 	if o.wrap != nil {
 		src = o.wrap(fs)
@@ -87,7 +93,8 @@ func newEnv(t *testing.T, o envOpts) *env {
 			{Name: "facturacion", KeySHA256: hashOf(keyFull), Precios: true},
 			{Name: "inventario", KeySHA256: hashOf(keyNoCost), Precios: false},
 		},
-		PriceFields:  []string{"precio_venta"},
+		PriceFields:  priceFields,
+		Fields:       o.fields,
 		IndexFields:  testIndexFields,
 		SearchFields: o.searchFields,
 		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -795,6 +802,170 @@ func TestHealthzIsNotAShortcutIntoTheAuthenticatedRoutes(t *testing.T) {
 		code, raw := e.getRaw(t, path, "")
 		if strings.Contains(raw, `"version":"v1"`) || strings.Contains(raw, "productos") || strings.Contains(raw, "LEVOFLOXACINO") {
 			t.Errorf("%s leaked data without a key (status %d): %s", path, code, raw)
+		}
+	}
+}
+
+// --- the API returns only the columns it was told to ---------------------------------------
+
+var wideRow = `{"id":1,"cum_facturar":"123-1","nombre":"A","estado":"OK","cod_auf":"101","precio_venta":10,"precio_maximo":12,` +
+	`"contrato Evento":"SI","Nombre":"mayus","datos_fuente":{"atc":"X","precio_maximo":9},"motivos":[{"codigo":"NT24"}]}`
+
+func keysOf(m map[string]any) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func TestOnlyTheConfiguredColumnsAreReturned(t *testing.T) {
+	e := newEnv(t, envOpts{
+		fields:      []string{"id", "cum_facturar", "nombre", "contrato Evento", "precio_maximo"},
+		priceFields: []string{"precio_venta", "precio_maximo"},
+	})
+	e.publish(t, "v1", wideRow)
+
+	want := func(key string, cols ...string) {
+		t.Helper()
+		for _, path := range []string{"/v1/productos/1", "/v1/productos?cum_facturar=123-1", "/v1/productos?limit=10"} {
+			code, body := e.get(t, path, key)
+			if code != 200 {
+				t.Fatalf("%s: %d %v", path, code, body)
+			}
+			row := body
+			if _, list := body["productos"]; list {
+				row = items(body)[0]
+			}
+			if got := keysOf(row); !slices.Equal(got, cols) {
+				t.Errorf("%s as %s returned columns %v, want %v", path, key, got, cols)
+			}
+		}
+	}
+	want(keyFull, "contrato Evento", "cum_facturar", "id", "nombre", "precio_maximo")
+	want(keyNoCost, "contrato Evento", "cum_facturar", "id", "nombre") // the price rule still applies to the allowed price column
+}
+
+func TestColumnsAreMatchedExactlyAndNestedOnesAreNotExposedByTheirParentsName(t *testing.T) {
+	e := newEnv(t, envOpts{fields: []string{"id", "nombre"}})
+	e.publish(t, "v1", wideRow)
+	_, raw := e.getRaw(t, "/v1/productos/1", keyFull)
+	if strings.Contains(raw, "mayus") || strings.Contains(raw, "datos_fuente") || strings.Contains(raw, "motivos") {
+		t.Errorf("a column that is not on the list leaked (matching must be exact, \"Nombre\" is not \"nombre\"): %s", raw)
+	}
+}
+
+func TestAllowedColumnsKeepTheirValuesAsPublished(t *testing.T) {
+	e := newEnv(t, envOpts{fields: []string{"id", "valor", "lista", "txt"}})
+	e.publish(t, "v1", `{"id":1,"valor":10.50,"lista":[{"a":1.0}],"txt":"ñ","otro":1}`)
+	for _, key := range []string{keyFull, keyNoCost} {
+		_, raw := e.getRaw(t, "/v1/productos/1", key)
+		for _, frag := range []string{`"valor":10.50`, `"a":1.0`, `"txt":"ñ"`} {
+			if !strings.Contains(raw, frag) {
+				t.Errorf("%s: %s missing in %s", key, frag, raw)
+			}
+		}
+	}
+}
+
+func TestChangesCarryOnlyTheConfiguredColumns(t *testing.T) {
+	e := newEnv(t, envOpts{fields: []string{"id", "nombre"}})
+	e.publish(t, "v1",
+		`{"id":1,"nombre":"A","estado":"OK"}`,
+		`{"id":2,"nombre":"B","estado":"OK"}`)
+	e.publish(t, "v2",
+		`{"id":1,"nombre":"A","estado":"ERROR"}`, // only a hidden column changed
+		`{"id":2,"nombre":"B2","estado":"ERROR"}`)
+
+	for _, key := range []string{keyFull, keyNoCost} {
+		_, body := e.get(t, "/v1/cambios?desde=0-0", key)
+		byID := map[string]map[string]any{}
+		for _, x := range events(body) {
+			byID[x["id"].(string)] = x
+		}
+		if _, ok := byID["1"]; ok {
+			t.Errorf("%s: an update that only touched a column the API does not return must not be delivered", key)
+		}
+		mod := byID["2"]
+		if mod == nil {
+			t.Fatalf("%s: the update of row 2 is missing: %v", key, body)
+		}
+		if got := mod["campos"].([]any); len(got) != 1 || got[0] != "nombre" {
+			t.Errorf("%s: campos = %v", key, mod["campos"])
+		}
+		// "antes" holds only the values the update replaced, "fila" the whole new row
+		if got := keysOf(mod["antes"].(map[string]any)); !slices.Equal(got, []string{"nombre"}) {
+			t.Errorf("%s: antes has columns %v", key, got)
+		}
+		if got := keysOf(mod["fila"].(map[string]any)); !slices.Equal(got, []string{"id", "nombre"}) {
+			t.Errorf("%s: fila has columns %v", key, got)
+		}
+		if strings.Contains(jsonString(body), "estado") {
+			t.Errorf("%s: the response mentions a column that is not returned: %v", key, body)
+		}
+		if body["siguiente"] == "0-0" {
+			t.Errorf("%s: the cursor must move past the update nobody receives", key)
+		}
+	}
+}
+
+func TestNewRefusesAPriceColumnThatConsumersWithoutPricesWouldSee(t *testing.T) {
+	restricted := []Consumer{{Name: "inventario", KeySHA256: hashOf("k"), Precios: false}}
+	_, err := New(&fakeSearch{}, Options{Consumers: restricted, PriceFields: []string{"precio_venta"}, Fields: []string{"id", "Precio_Maximo"}})
+	if err == nil || !strings.Contains(err.Error(), "NT_PRICE_FIELDS") || !strings.Contains(err.Error(), "Precio_Maximo") {
+		t.Fatalf("a price column missing from NT_PRICE_FIELDS must stop the server, got %v", err)
+	}
+	if _, err := New(&fakeSearch{}, Options{Consumers: restricted, PriceFields: []string{"precio_venta", "precio_maximo"}, Fields: []string{"id", "Precio_Maximo"}}); err != nil {
+		t.Errorf("a price column listed in NT_PRICE_FIELDS is fine: %v", err)
+	}
+	full := []Consumer{{Name: "x", KeySHA256: hashOf("k"), Precios: true}}
+	if _, err := New(&fakeSearch{}, Options{Consumers: full, Fields: []string{"id", "precio_maximo"}}); err != nil {
+		t.Errorf("when everybody may see prices nothing has to be hidden: %v", err)
+	}
+}
+
+// --- filters and search cannot probe a column the API does not return ---------------------
+
+func TestFiltersAndSearchOnlyUseTheReturnedColumns(t *testing.T) {
+	e := newEnv(t, envOpts{
+		fields:       []string{"id", "cum_facturar", "nombre"},
+		searchFields: []string{"nombre", "estado"},
+	})
+	e.publish(t, "v1", baseRows...)
+
+	for _, key := range []string{keyFull, keyNoCost} {
+		code, body := e.get(t, "/v1/productos?estado=ERROR", key)
+		if code != http.StatusBadRequest {
+			t.Errorf("%s: filtering by a column that is not returned: status %d, want 400: %v", key, code, body)
+		}
+		if strings.Contains(jsonString(body), "estado") || strings.Contains(jsonString(body), "precio_venta") {
+			t.Errorf("%s: the error names a column that is not returned: %v", key, body)
+		}
+		if code, body := e.get(t, "/v1/productos?cum_facturar=123-1", key); code != 200 || len(items(body)) != 1 {
+			t.Errorf("%s: a returned column still filters: %d %v", key, code, body)
+		}
+		if code, _ := e.get(t, "/v1/productos?q=acido", key); code != 200 || e.fs.gotQuery != "@nombre:(*acido*)" {
+			t.Errorf("%s: search must use only the returned columns, query = %q (status %d)", key, e.fs.gotQuery, code)
+		}
+	}
+
+	e = newEnv(t, envOpts{fields: []string{"id"}, searchFields: []string{"estado"}})
+	e.publish(t, "v1", baseRows...)
+	if code, _ := e.get(t, "/v1/productos?q=ok", keyFull); code != http.StatusForbidden {
+		t.Errorf("a search over columns that are not returned must be refused, got %d", code)
+	}
+}
+
+func TestEventFieldNamesAreFilteredWhateverTheKind(t *testing.T) {
+	s := &server{fields: set([]string{"id", "nombre"}), priceLC: lowerSet([]string{"precio_maximo"})}
+	for _, c := range []Consumer{{Name: "a", Precios: true}, {Name: "b", Precios: false}} {
+		v, ok, err := s.eventFor(c, publish.ChangeEvent{Kind: "creado", ID: "1", Fields: []string{"estado", "precio_maximo", "nombre"}, Row: json.RawMessage(`{"id":1,"estado":"X"}`)})
+		if err != nil || !ok {
+			t.Fatalf("%s: a created row is always delivered: %v %v", c.Name, ok, err)
+		}
+		if strings.Contains(strings.Join(v.Campos, ","), "estado") || strings.Contains(strings.Join(v.Campos, ","), "precio_maximo") {
+			t.Errorf("%s: campos names a column that is not visible: %v", c.Name, v.Campos)
 		}
 	}
 }
