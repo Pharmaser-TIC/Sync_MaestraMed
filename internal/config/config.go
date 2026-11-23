@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +28,7 @@ type HTTP struct {
 	Addr          string   // listen address; loopback by default, TLS and exposure belong to the reverse proxy
 	ConsumersFile string   // JSON file with the projects allowed to call the API
 	PriceFields   []string // row fields hidden from the consumers that may not see prices
+	Fields        []string // columns the API returns (NT_API_FIELDS); nil, from "*", returns every column
 }
 
 // Redis groups the Redis connection settings.
@@ -102,7 +104,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	c.HTTP.Addr = get("NT_HTTP_ADDR", "127.0.0.1:8080")
 	c.HTTP.ConsumersFile = get("NT_CONSUMERS_FILE", "consumers.json")
-	for _, f := range strings.Split(get("NT_PRICE_FIELDS", "precio_venta"), ",") {
+	for _, f := range strings.Split(get("NT_PRICE_FIELDS", "precio_venta,precio_maximo"), ",") {
 		if f = strings.TrimSpace(f); f == "" {
 			continue
 		}
@@ -112,10 +114,39 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		}
 		c.HTTP.PriceFields = append(c.HTTP.PriceFields, f)
 	}
+	var fieldsErr error
+	if c.HTTP.Fields, fieldsErr = parseAPIFields(get("NT_API_FIELDS", defaultAPIFields)); fieldsErr != nil {
+		errs = append(errs, fieldsErr)
+	}
 	if len(errs) > 0 {
 		return Config{}, errors.Join(errs...)
 	}
 	return c, nil
+}
+
+// defaultAPIFields are the columns the HTTP API returns unless NT_API_FIELDS says otherwise.
+const defaultAPIFields = "id,cum_facturar,contrato,contrato Evento,tipo_producto,descripcion,cod_gen_siesa,cod_mutual,activo," +
+	"ffm_rips,umm_rips,upr_rips,descripcion_siesa,atc,registro_sanitario,estado_registro,clasificacion_entrega,plu,subplan,precio_maximo"
+
+// parseAPIFields reads NT_API_FIELDS: a comma separated list of exact column names (a name may contain
+// spaces) or "*" for every column. A list with no column at all is an error, because an empty list
+// must not turn into "every column" by accident.
+func parseAPIFields(raw string) ([]string, error) {
+	var out []string
+	for _, f := range strings.Split(raw, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	switch {
+	case len(out) == 0:
+		return nil, errors.New("NT_API_FIELDS must list at least one column, or be * for every column")
+	case slices.Contains(out, "*") && len(out) > 1:
+		return nil, errors.New("NT_API_FIELDS: * means every column and cannot be mixed with column names")
+	case out[0] == "*":
+		return nil, nil
+	}
+	return out, nil
 }
 
 // validFieldName accepts the characters of a plain JSON key, so a field can be used in a

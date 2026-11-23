@@ -1,6 +1,7 @@
 package config
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -67,7 +68,7 @@ func TestHTTPSettingsDefaultToLoopbackAndTheDocumentedPriceField(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.HTTP.Addr != "127.0.0.1:8080" || c.HTTP.ConsumersFile != "consumers.json" || len(c.HTTP.PriceFields) != 1 || c.HTTP.PriceFields[0] != "precio_venta" {
+	if c.HTTP.Addr != "127.0.0.1:8080" || c.HTTP.ConsumersFile != "consumers.json" || !slices.Equal(c.HTTP.PriceFields, []string{"precio_venta", "precio_maximo"}) {
 		t.Errorf("defaults = %+v", c.HTTP)
 	}
 	base["NT_HTTP_ADDR"] = ":9000"
@@ -96,6 +97,50 @@ func TestLoadReportsEveryProblem(t *testing.T) {
 	for _, want := range []string{"NT_API_URL", "NT_API_KEY", "REDIS_ADDR", "POLL_INTERVAL", "REDIS_KEEP_VERSIONS"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error does not mention %s: %v", want, err)
+		}
+	}
+}
+
+func TestAPIFieldsDefaultToTheAgreedColumnsAndCanBeOverridden(t *testing.T) {
+	base := map[string]string{"NT_API_URL": "https://h/api.php", "NT_API_KEY": "k", "REDIS_ADDR": "r:6379"}
+	c, err := Load(env(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"id", "cum_facturar", "contrato", "contrato Evento", "tipo_producto", "descripcion", "cod_gen_siesa",
+		"cod_mutual", "activo", "ffm_rips", "umm_rips", "upr_rips", "descripcion_siesa", "atc", "registro_sanitario",
+		"estado_registro", "clasificacion_entrega", "plu", "subplan", "precio_maximo"} {
+		if !slices.Contains(c.HTTP.Fields, f) {
+			t.Errorf("default NT_API_FIELDS lacks %q: %v", f, c.HTTP.Fields)
+		}
+	}
+	if len(c.HTTP.Fields) != 20 {
+		t.Errorf("default NT_API_FIELDS has %d columns, want 20: %v", len(c.HTTP.Fields), c.HTTP.Fields)
+	}
+
+	base["NT_API_FIELDS"] = " id, contrato Evento ,,plu"
+	if c, err = Load(env(base)); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(c.HTTP.Fields, []string{"id", "contrato Evento", "plu"}) {
+		t.Errorf("parsed = %v", c.HTTP.Fields)
+	}
+
+	base["NT_API_FIELDS"] = "*"
+	if c, err = Load(env(base)); err != nil {
+		t.Fatal(err)
+	}
+	if c.HTTP.Fields != nil {
+		t.Errorf("\"*\" returns every column, got %v", c.HTTP.Fields)
+	}
+}
+
+func TestAPIFieldsRefuseAnEmptyListAndAMixedStar(t *testing.T) {
+	base := map[string]string{"NT_API_URL": "https://h/api.php", "NT_API_KEY": "k", "REDIS_ADDR": "r:6379"}
+	for _, bad := range []string{",,", " , ", "*,id", "id,*"} {
+		base["NT_API_FIELDS"] = bad
+		if _, err := Load(env(base)); err == nil || !strings.Contains(err.Error(), "NT_API_FIELDS") {
+			t.Errorf("NT_API_FIELDS=%q must be refused, got %v", bad, err)
 		}
 	}
 }

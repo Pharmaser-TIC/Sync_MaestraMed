@@ -63,7 +63,7 @@ func TestServeHTTPWiresTheConfigConsumersAndRedisTogether(t *testing.T) {
 	cfg := config.Config{
 		IndexFields: []string{"cum_facturar"},
 		Redis:       config.Redis{Addr: mr.Addr(), Prefix: "nt"},
-		HTTP:        config.HTTP{Addr: freeAddr(t), ConsumersFile: file, PriceFields: []string{"precio_venta"}},
+		HTTP:        config.HTTP{Addr: freeAddr(t), ConsumersFile: file, PriceFields: []string{"precio_venta"}, Fields: []string{"id", "nombre", "precio_venta"}},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -92,6 +92,9 @@ func TestServeHTTPWiresTheConfigConsumersAndRedisTogether(t *testing.T) {
 	}
 	if code != 200 || full["precio_venta"] != float64(10) {
 		t.Fatalf("consumer with prices: %d %v", code, full)
+	}
+	if _, has := full["cum_facturar"]; has {
+		t.Errorf("NT_API_FIELDS must reach the API: a column that is not listed was returned: %v", full)
 	}
 	if code, restricted := get("restricted"); code != 200 || restricted["nombre"] != "ACIDO" || restricted["precio_venta"] != nil {
 		t.Fatalf("consumer without prices: %d %v", code, restricted)

@@ -30,7 +30,7 @@ func main() {
 	envFile := flag.String("env", ".env", "file with KEY=VALUE settings; variables already set in the environment win; a missing file is ignored")
 	debug := flag.Bool("debug", false, "log every cycle, including the ones without changes")
 	check := flag.Bool("check", false, "read back what is stored in Redis, print a report and exit (1 when something is wrong); does not call the API")
-	serve := flag.Bool("serve", false, "serve the products over a read-only HTTP API (see NT_HTTP_ADDR, NT_CONSUMERS_FILE, NT_PRICE_FIELDS); does not call the upstream API or synchronize")
+	serve := flag.Bool("serve", false, "serve the products over a read-only HTTP API (see NT_HTTP_ADDR, NT_CONSUMERS_FILE, NT_PRICE_FIELDS, NT_API_FIELDS); does not call the upstream API or synchronize")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -93,6 +93,7 @@ func serveHTTP(ctx context.Context, log *slog.Logger, cfg config.Config, pub *pu
 	h, err := httpapi.New(pub, httpapi.Options{
 		Consumers:    consumers,
 		PriceFields:  cfg.HTTP.PriceFields,
+		Fields:       cfg.HTTP.Fields,
 		IndexFields:  cfg.IndexFields,
 		SearchFields: cfg.SearchFields,
 		Log:          log,
@@ -101,8 +102,16 @@ func serveHTTP(ctx context.Context, log *slog.Logger, cfg config.Config, pub *pu
 		return err
 	}
 	log.Info("serving", "consumers", len(consumers), "redis", cfg.Redis.Addr, "prefix", cfg.Redis.Prefix,
-		"hidden_without_prices", strings.Join(cfg.HTTP.PriceFields, ","))
+		"hidden_without_prices", strings.Join(cfg.HTTP.PriceFields, ","), "columns", columnsLog(cfg.HTTP.Fields))
 	return httpapi.Serve(ctx, cfg.HTTP.Addr, h, log)
+}
+
+// columnsLog describes the columns the API returns, for the start-up log line.
+func columnsLog(fields []string) string {
+	if fields == nil {
+		return "all"
+	}
+	return fmt.Sprintf("%d (%s)", len(fields), strings.Join(fields, ","))
 }
 
 func run(log *slog.Logger, once, check, serve bool) error {

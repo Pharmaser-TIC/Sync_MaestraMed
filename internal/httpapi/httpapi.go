@@ -52,6 +52,7 @@ type Source interface {
 type Options struct {
 	Consumers    []Consumer
 	PriceFields  []string // top-level row fields hidden from consumers without Precios
+	Fields       []string // columns the API returns; nil returns every column
 	IndexFields  []string // fields that can be used as exact filters
 	SearchFields []string // fields behind the text search; empty turns ?q= off
 	Log          *slog.Logger
@@ -62,6 +63,7 @@ type server struct {
 	src     Source
 	cons    []Consumer
 	priceLC map[string]bool // lower-case price field names
+	fields  map[string]bool // columns that are returned, matched exactly; nil returns every column
 	index   map[string]bool
 	slots   chan struct{} // one token per request being served
 	search  []string
@@ -83,12 +85,27 @@ func New(src Source, opt Options) (http.Handler, error) {
 		src: src, cons: opt.Consumers, priceLC: lowerSet(opt.PriceFields), index: set(opt.IndexFields),
 		search: opt.SearchFields, log: opt.Log, slots: make(chan struct{}, inFlight),
 	}
+	if opt.Fields != nil {
+		s.fields = set(opt.Fields)
+	}
 	if s.log == nil {
 		s.log = slog.Default()
 	}
 	for _, c := range opt.Consumers {
 		if !c.Precios && len(opt.PriceFields) == 0 {
 			return nil, fmt.Errorf("consumer %q cannot see prices but NT_PRICE_FIELDS is empty: nothing would be hidden", c.Name)
+		}
+	}
+	// A column that looks like a price but is not in NT_PRICE_FIELDS would reach the consumers that may
+	// not see prices. Refusing to start is safer than guessing which of them is one.
+	for _, c := range opt.Consumers {
+		if c.Precios {
+			continue
+		}
+		for _, f := range opt.Fields {
+			if strings.Contains(strings.ToLower(f), "precio") && !s.isPrice(f) {
+				return nil, fmt.Errorf("column %q looks like a price but is not in NT_PRICE_FIELDS: consumer %q, which cannot see prices, would receive it", f, c.Name)
+			}
 		}
 	}
 	for _, f := range opt.SearchFields {
@@ -245,11 +262,12 @@ func (s *server) isPrice(name string) bool {
 	return s.priceLC[strings.ToLower(strings.TrimSpace(name))]
 }
 
-// view removes the price fields of a row for consumers that may not see them, at any depth
-// (objects inside objects and arrays). The row of a consumer with access is passed through
-// untouched. Numbers keep the text they were published with.
+// view shapes a row for a consumer: only the configured columns are kept (matched exactly, at the top
+// level) and, for a consumer that may not see prices, the price fields are removed at any depth
+// (objects inside objects and arrays). Numbers keep the text they were published with. When there is
+// nothing to cut the row is passed through untouched.
 func (s *server) view(c Consumer, raw []byte) (json.RawMessage, error) {
-	if c.Precios || len(raw) == 0 {
+	if len(raw) == 0 || (c.Precios && s.fields == nil) {
 		return raw, nil
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
@@ -258,13 +276,32 @@ func (s *server) view(c Consumer, raw []byte) (json.RawMessage, error) {
 	if err := dec.Decode(&v); err != nil {
 		return nil, err
 	}
+	if m, ok := v.(map[string]any); ok && s.fields != nil {
+		for k := range m {
+			if !s.fields[k] {
+				delete(m, k)
+			}
+		}
+	}
+	if !c.Precios {
+		v = s.withoutPrices(v)
+	}
 	var out bytes.Buffer
 	enc := json.NewEncoder(&out)
 	enc.SetEscapeHTML(false)
-	if err := enc.Encode(s.withoutPrices(v)); err != nil {
+	if err := enc.Encode(v); err != nil {
 		return nil, err
 	}
 	return bytes.TrimRight(out.Bytes(), "\n"), nil
+}
+
+// returned says whether the API returns a column at all.
+func (s *server) returned(field string) bool { return s.fields == nil || s.fields[field] }
+
+// visible says whether a consumer receives a column: it must be one the API returns and, without
+// price access, not a price.
+func (s *server) visible(c Consumer, field string) bool {
+	return s.returned(field) && (c.Precios || !s.isPrice(field))
 }
 
 func (s *server) withoutPrices(v any) any {
@@ -437,10 +474,12 @@ func (s *server) list(w http.ResponseWriter, r *http.Request, token string, limi
 
 func (s *server) byField(w http.ResponseWriter, r *http.Request, field, value string, offset, limit int) {
 	c := consumerOf(r)
-	if !s.index[field] {
+	// A filter is a question about the stored value, so a column the API does not return cannot be
+	// used: the answers would let a caller find out what it holds.
+	if !s.index[field] || !s.returned(field) {
 		fields := make([]string, 0, len(s.index))
 		for f := range s.index {
-			if c.Precios || !s.isPrice(f) {
+			if s.visible(c, f) {
 				fields = append(fields, f)
 			}
 		}
@@ -495,7 +534,7 @@ func (s *server) byText(w http.ResponseWriter, r *http.Request, text string, off
 	}
 	var fields []string
 	for _, f := range s.search {
-		if c.Precios || !s.isPrice(f) {
+		if s.visible(c, f) {
 			fields = append(fields, f)
 		}
 	}
@@ -619,11 +658,12 @@ func (s *server) cambios(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"eventos": out, "siguiente": siguiente, "hay_mas": hasMore})
 }
 
-// eventFor adapts a change to a consumer. For one without price access the price fields are
-// removed everywhere, and an update that only touched prices is not delivered at all.
+// eventFor adapts a change to a consumer: rows carry only the columns the API returns, the price
+// fields are removed for one without price access, and an update that touched nothing the consumer
+// can see is not delivered at all.
 func (s *server) eventFor(c Consumer, e publish.ChangeEvent) (eventView, bool, error) {
 	v := eventView{Evento: e.StreamID, Tipo: e.Kind, ID: e.ID, Version: e.Version, Anterior: e.Previous, Campos: e.Fields, Antes: e.Before, Fila: e.Row}
-	if c.Precios {
+	if c.Precios && s.fields == nil {
 		return v, true, nil
 	}
 	var err error
@@ -633,18 +673,13 @@ func (s *server) eventFor(c Consumer, e publish.ChangeEvent) (eventView, bool, e
 	if v.Antes, err = s.view(c, e.Before); err != nil {
 		return v, false, err
 	}
-	if e.Kind == "modificado" {
-		v.Campos = nil
-		for _, f := range e.Fields {
-			if !s.isPrice(f) {
-				v.Campos = append(v.Campos, f)
-			}
-		}
-		if len(v.Campos) == 0 {
-			return v, false, nil
+	v.Campos = nil
+	for _, f := range e.Fields {
+		if s.visible(c, f) {
+			v.Campos = append(v.Campos, f)
 		}
 	}
-	return v, true, nil
+	return v, e.Kind != "modificado" || len(v.Campos) > 0, nil
 }
 
 // normalizeStreamID checks a stream id and rewrites it without leading zeros, so that "0001-02" and
