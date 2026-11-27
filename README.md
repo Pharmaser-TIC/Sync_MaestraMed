@@ -41,7 +41,7 @@ Docker: `docker build -t nt-sync .` and run it with the same variables and a vol
 | `REDIS_KEEP_VERSIONS` | `2` | Versions kept in Redis (current + previous ones) |
 | `POLL_INTERVAL` | `30s` | Time between `nt_version` checks (30-60 s recommended) |
 | `SQLITE_PATH` | `data/nt.db` | Local copy |
-| `NT_HTTP_ADDR`, `NT_CONSUMERS_FILE`, `NT_PRICE_FIELDS`, `NT_API_FIELDS` | `127.0.0.1:8080`, `consumers.json`, `precio_venta,precio_maximo`, 20 columns | Only for `nt-sync -serve` (see "HTTP API") |
+| `NT_HTTP_ADDR`, `NT_CONSUMERS_FILE`, `NT_PRICE_FIELDS`, `NT_API_FIELDS` | `127.0.0.1:8080`, `consumers.json`, `precio_venta,precio_maximo,precio_final,precio_contrato`, 25 columns | Only for `nt-sync -serve` (see "HTTP API") |
 | `NT_CHANGES_MAXLEN` | `100000` | Entries kept in the `nt:cambios` change stream (see "Change stream"); `0` turns it off |
 | `NT_INDEX_FIELDS` | `cum_facturar,cod_auf,cod_mutual,estado,contrato` | Fields that get a lookup set |
 | `NT_SEARCH_FIELDS` | empty (search off) | Fields indexed for full-text search, e.g. `descripcion,descripcion_siesa`; needs Redis 8 or Redis Stack (see "Full-text search") |
@@ -185,8 +185,8 @@ SQLite and never writes to Redis. It reads the same `.env`.
 |---|---|---|
 | `NT_HTTP_ADDR` | `127.0.0.1:8080` | Listen address. Loopback by default: publish it through a reverse proxy with TLS |
 | `NT_CONSUMERS_FILE` | `consumers.json` | Projects allowed to call the API (see below). The server refuses to start without it |
-| `NT_PRICE_FIELDS` | `precio_venta,precio_maximo` | Row fields hidden from the projects that may not see prices |
-| `NT_API_FIELDS` | the 20 columns below | Columns the API returns, comma separated, matched exactly (case and spaces count). `*` returns every column |
+| `NT_PRICE_FIELDS` | `precio_venta,precio_maximo,precio_final,precio_contrato` | Row fields hidden from the projects that may not see prices |
+| `NT_API_FIELDS` | the 25 columns below | Columns the API returns, comma separated, matched exactly (case and spaces count). `*` returns every column |
 
 ### Which columns it returns
 
@@ -195,7 +195,7 @@ Redis keeps the whole row, but the API returns only the columns in `NT_API_FIELD
 
 `id, cum_facturar, contrato, contrato Evento, tipo_producto, descripcion, cod_gen_siesa, cod_mutual, activo,
 ffm_rips, umm_rips, upr_rips, descripcion_siesa, atc, registro_sanitario, estado_registro,
-clasificacion_entrega, plu, subplan, precio_maximo`
+clasificacion_entrega, plu, subplan, precio_maximo, precio_final, precio_contrato, estado, clasificacion, cod_auf`
 
 - It is an allow list on the top-level columns: a column that is not listed is never returned, whatever its
   name, and one that is listed but absent from a row is simply not there. Adding a column is a change of
@@ -208,7 +208,12 @@ clasificacion_entrega, plu, subplan, precio_maximo`
 - A list with no column, or `*` mixed with names, stops the server from starting.
 - The server also refuses to start when a column whose name contains `precio` is listed in `NT_API_FIELDS`
   but not in `NT_PRICE_FIELDS` and some project cannot see prices. **If your `.env` sets `NT_PRICE_FIELDS`
-  explicitly, add `precio_maximo` to it before upgrading.**
+  explicitly, add `precio_maximo`, `precio_final` and `precio_contrato` to it before upgrading.** The
+  price columns of the default list are exactly the four of the default `NT_PRICE_FIELDS`.
+- `estado` and `cod_auf` are in the default `NT_INDEX_FIELDS`, so once they are returned they also work as
+  exact filters (`?estado=ACTIVO`, `?cod_auf=1957`). If your `.env` sets `NT_INDEX_FIELDS` explicitly it must
+  list them, and a change of that setting only applies to the next published version: to get it
+  now, delete the local copy (`rm data/nt.db`) and run `./nt-sync -once`, which downloads and republishes.
 
 ### Who can call it, and who sees prices
 
@@ -231,7 +236,8 @@ printf %s "$KEY" | sha256sum | cut -d' ' -f1     # put this in "key_sha256"
   that is not 64 hex characters stops the server from starting. Revoke a project by removing its entry and
   restarting.
 - A project with `"precios": false` receives every product **without the fields in `NT_PRICE_FIELDS`** (by default
-  `precio_venta` and `precio_maximo`; the second one is part of the returned columns), in
+  `precio_venta`, `precio_maximo`, `precio_final` and `precio_contrato`; the last three are part of the
+  returned columns), in
   every endpoint, including `antes`/`fila`/`campos` of the changes. An update that only touched prices is not
   delivered to it, and it cannot filter or search by a price field (403).
 - It is a deny list: field names are matched ignoring case, and also inside nested objects and arrays, but

@@ -22,6 +22,11 @@ func TestLoadDefaults(t *testing.T) {
 	if len(c.IndexFields) != 5 || c.IndexFields[0] != "cum_facturar" {
 		t.Errorf("index fields = %v", c.IndexFields)
 	}
+	for _, f := range []string{"cod_auf", "estado"} { // exact filters the billing app uses
+		if !slices.Contains(c.IndexFields, f) {
+			t.Errorf("default NT_INDEX_FIELDS lacks %q: %v", f, c.IndexFields)
+		}
+	}
 }
 
 func TestSearchFieldsAreOffByDefaultAndParsed(t *testing.T) {
@@ -68,7 +73,7 @@ func TestHTTPSettingsDefaultToLoopbackAndTheDocumentedPriceField(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.HTTP.Addr != "127.0.0.1:8080" || c.HTTP.ConsumersFile != "consumers.json" || !slices.Equal(c.HTTP.PriceFields, []string{"precio_venta", "precio_maximo"}) {
+	if c.HTTP.Addr != "127.0.0.1:8080" || c.HTTP.ConsumersFile != "consumers.json" || !slices.Equal(c.HTTP.PriceFields, []string{"precio_venta", "precio_maximo", "precio_final", "precio_contrato"}) {
 		t.Errorf("defaults = %+v", c.HTTP)
 	}
 	base["NT_HTTP_ADDR"] = ":9000"
@@ -109,13 +114,14 @@ func TestAPIFieldsDefaultToTheAgreedColumnsAndCanBeOverridden(t *testing.T) {
 	}
 	for _, f := range []string{"id", "cum_facturar", "contrato", "contrato Evento", "tipo_producto", "descripcion", "cod_gen_siesa",
 		"cod_mutual", "activo", "ffm_rips", "umm_rips", "upr_rips", "descripcion_siesa", "atc", "registro_sanitario",
-		"estado_registro", "clasificacion_entrega", "plu", "subplan", "precio_maximo"} {
+		"estado_registro", "clasificacion_entrega", "plu", "subplan", "precio_maximo",
+		"precio_final", "precio_contrato", "estado", "clasificacion", "cod_auf"} {
 		if !slices.Contains(c.HTTP.Fields, f) {
 			t.Errorf("default NT_API_FIELDS lacks %q: %v", f, c.HTTP.Fields)
 		}
 	}
-	if len(c.HTTP.Fields) != 20 {
-		t.Errorf("default NT_API_FIELDS has %d columns, want 20: %v", len(c.HTTP.Fields), c.HTTP.Fields)
+	if len(c.HTTP.Fields) != 25 {
+		t.Errorf("default NT_API_FIELDS has %d columns, want 25: %v", len(c.HTTP.Fields), c.HTTP.Fields)
 	}
 
 	base["NT_API_FIELDS"] = " id, contrato Evento ,,plu"
