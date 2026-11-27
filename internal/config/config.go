@@ -104,7 +104,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	c.HTTP.Addr = get("NT_HTTP_ADDR", "127.0.0.1:8080")
 	c.HTTP.ConsumersFile = get("NT_CONSUMERS_FILE", "consumers.json")
-	for _, f := range strings.Split(get("NT_PRICE_FIELDS", "precio_venta,precio_maximo"), ",") {
+	for _, f := range strings.Split(get("NT_PRICE_FIELDS", defaultPriceFields), ",") {
 		if f = strings.TrimSpace(f); f == "" {
 			continue
 		}
@@ -126,7 +126,12 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 
 // defaultAPIFields are the columns the HTTP API returns unless NT_API_FIELDS says otherwise.
 const defaultAPIFields = "id,cum_facturar,contrato,contrato Evento,tipo_producto,descripcion,cod_gen_siesa,cod_mutual,activo," +
-	"ffm_rips,umm_rips,upr_rips,descripcion_siesa,atc,registro_sanitario,estado_registro,clasificacion_entrega,plu,subplan,precio_maximo"
+	"ffm_rips,umm_rips,upr_rips,descripcion_siesa,atc,registro_sanitario,estado_registro,clasificacion_entrega,plu,subplan,precio_maximo," +
+	"precio_final,precio_contrato,estado,clasificacion,cod_auf"
+
+// defaultPriceFields are hidden from the projects that may not see prices. Every price column in
+// defaultAPIFields must be here: the HTTP API refuses to start otherwise (see httpapi.New).
+const defaultPriceFields = "precio_venta,precio_maximo,precio_final,precio_contrato"
 
 // parseAPIFields reads NT_API_FIELDS: a comma separated list of exact column names (a name may contain
 // spaces) or "*" for every column. A list with no column at all is an error, because an empty list

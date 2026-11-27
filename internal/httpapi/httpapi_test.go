@@ -17,6 +17,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 
+	"nt-sync/internal/config"
 	"nt-sync/internal/model"
 	"nt-sync/internal/publish"
 )
@@ -54,6 +55,7 @@ type env struct {
 	p   *publish.Publisher
 	mr  *miniredis.Miniredis
 	fs  *fakeSearch
+	idx []string // fields indexed when publishing
 }
 
 type envOpts struct {
@@ -64,6 +66,7 @@ type envOpts struct {
 	wrap         func(Source) Source
 	fields       []string // columns the API returns; nil returns every column
 	priceFields  []string // nil means precio_venta
+	indexFields  []string // nil means testIndexFields
 }
 
 func newEnv(t *testing.T, o envOpts) *env {
@@ -83,6 +86,9 @@ func newEnv(t *testing.T, o envOpts) *env {
 	if priceFields == nil {
 		priceFields = []string{"precio_venta"}
 	}
+	if o.indexFields == nil {
+		o.indexFields = testIndexFields
+	}
 	var src Source = fs
 	if o.wrap != nil {
 		src = o.wrap(fs)
@@ -95,7 +101,7 @@ func newEnv(t *testing.T, o envOpts) *env {
 		},
 		PriceFields:  priceFields,
 		Fields:       o.fields,
-		IndexFields:  testIndexFields,
+		IndexFields:  o.indexFields,
 		SearchFields: o.searchFields,
 		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
@@ -104,7 +110,7 @@ func newEnv(t *testing.T, o envOpts) *env {
 	}
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
-	return &env{srv: srv, rdb: rdb, p: p, mr: mr, fs: fs}
+	return &env{srv: srv, rdb: rdb, p: p, mr: mr, fs: fs, idx: o.indexFields}
 }
 
 func (e *env) publish(t *testing.T, version string, filas ...string) {
@@ -113,7 +119,7 @@ func (e *env) publish(t *testing.T, version string, filas ...string) {
 	for _, f := range filas {
 		s.Filas = append(s.Filas, json.RawMessage(f))
 	}
-	rows, err := s.Rows(testIndexFields)
+	rows, err := s.Rows(e.idx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -967,5 +973,86 @@ func TestEventFieldNamesAreFilteredWhateverTheKind(t *testing.T) {
 		if strings.Contains(strings.Join(v.Campos, ","), "estado") || strings.Contains(strings.Join(v.Campos, ","), "precio_maximo") {
 			t.Errorf("%s: campos names a column that is not visible: %v", c.Name, v.Campos)
 		}
+	}
+}
+
+// --- the columns the billing app (Tessia) needs ----------------------------------------------
+
+func defaultConfig(t *testing.T) config.Config {
+	t.Helper()
+	env := map[string]string{"NT_API_URL": "https://h/api.php", "NT_API_KEY": "k", "REDIS_ADDR": "r:6379"}
+	c, err := config.Load(func(k string) (string, bool) { v, ok := env[k]; return v, ok })
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+const billingRow = `{"id":7,"cum_facturar":"900-1","cod_auf":"1957","estado":"ACTIVO","clasificacion":"B","descripcion":"ACIDO",` +
+	`"precio_venta":10,"precio_maximo":12,"precio_final":11.5,"precio_contrato":9,"precio_digitado":3,"origen_precio":"X"}`
+
+func TestTheDefaultColumnsServeTheBillingFieldsAndStillHidePricesFromRestrictedKeys(t *testing.T) {
+	cfg := defaultConfig(t)
+	e := newEnv(t, envOpts{fields: cfg.HTTP.Fields, priceFields: cfg.HTTP.PriceFields, indexFields: cfg.IndexFields})
+	e.publish(t, "v1", billingRow)
+
+	_, full := e.get(t, "/v1/productos/7", keyFull)
+	for _, col := range []string{"precio_final", "precio_contrato", "precio_maximo", "estado", "clasificacion", "cod_auf"} {
+		if _, ok := full[col]; !ok {
+			t.Errorf("a project that may see prices lacks %q: %v", col, keysOf(full))
+		}
+	}
+	if full["precio_final"] != 11.5 || full["precio_contrato"] != float64(9) {
+		t.Errorf("price values changed: %v", full)
+	}
+	for _, col := range []string{"precio_digitado", "origen_precio"} {
+		if _, ok := full[col]; ok {
+			t.Errorf("%q is not one of the agreed columns but was returned", col)
+		}
+	}
+
+	for _, path := range []string{"/v1/productos/7", "/v1/productos?cod_auf=1957", "/v1/productos?estado=activo", "/v1/productos?limit=5"} {
+		code, body := e.get(t, path, keyNoCost)
+		if code != 200 {
+			t.Fatalf("%s: %d %v", path, code, body)
+		}
+		row := body
+		if _, list := body["productos"]; list {
+			row = items(body)[0]
+		}
+		for col := range row {
+			if strings.Contains(strings.ToLower(col), "precio") {
+				t.Errorf("%s: a project without prices received %q", path, col)
+			}
+		}
+		for _, col := range []string{"estado", "clasificacion", "cod_auf"} {
+			if _, ok := row[col]; !ok {
+				t.Errorf("%s: a project without prices lacks %q", path, col)
+			}
+		}
+	}
+	if code, _ := e.get(t, "/v1/productos?precio_final=11.5", keyNoCost); code == 200 {
+		t.Error("a project without prices must not filter by a price column")
+	}
+}
+
+func TestTheServerRefusesTheDefaultColumnsWithAnOldPriceList(t *testing.T) {
+	// A .env written before precio_final and precio_contrato were returned lists only the older price
+	// fields: starting would hand those two columns to the projects that may not see prices.
+	cfg := defaultConfig(t)
+	_, err := New(nil, Options{
+		Consumers:   []Consumer{{Name: "inventario", KeySHA256: hashOf(keyNoCost)}},
+		PriceFields: []string{"precio_venta", "precio_maximo"},
+		Fields:      cfg.HTTP.Fields,
+	})
+	if err == nil || !strings.Contains(err.Error(), "precio_final") {
+		t.Fatalf("expected a refusal naming precio_final, got %v", err)
+	}
+	if _, err := New(nil, Options{
+		Consumers:   []Consumer{{Name: "inventario", KeySHA256: hashOf(keyNoCost)}},
+		PriceFields: cfg.HTTP.PriceFields,
+		Fields:      cfg.HTTP.Fields,
+	}); err != nil {
+		t.Fatalf("the shipped defaults must start: %v", err)
 	}
 }
