@@ -3,6 +3,7 @@ package publish
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -168,5 +169,30 @@ func TestInspectReportsTheSearchIndexAndItsProblems(t *testing.T) {
 	rep, err = p.Inspect(ctx)
 	if err != nil || rep.OK() {
 		t.Fatalf("a missing index must be reported as a problem: err=%v problems=%v", err, rep.Problems)
+	}
+}
+
+func TestSearchCanReadAKeptVersionThroughItsOwnIndex(t *testing.T) {
+	p, _ := searchSetup(t)
+	ctx := context.Background()
+	for i, v := range []string{"v1", "v2"} {
+		s, r := build(t, v, fmt.Sprintf(`{"id":%d,"nombre":"MEDICAMENTO %s"}`, i+1, strings.ToUpper(v)), `{"id":1,"nombre":"COMUN"}`)
+		if err := p.Publish(ctx, s, r); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// the alias answers with the current version...
+	ver, ids, total, err := p.SearchIDs(ctx, "@nombre:medicamento", 0, 10)
+	if err != nil || ver != "v2" || total != 1 || !slices.Equal(ids, []string{"2"}) {
+		t.Fatalf("alias: %q %v %d %v", ver, ids, total, err)
+	}
+	// ...and the index of the older one still answers for that exact version
+	ids, total, err = p.SearchIDsIn(ctx, "v1", "@nombre:medicamento", 0, 10)
+	if err != nil || total != 1 || !slices.Equal(ids, []string{"1"}) {
+		t.Errorf("pinned: %v %d %v", ids, total, err)
+	}
+	if _, _, err = p.SearchIDsIn(ctx, "v9", "@nombre:medicamento", 0, 10); !errors.Is(err, ErrVersionGone) {
+		t.Errorf("unknown version: %v", err)
 	}
 }

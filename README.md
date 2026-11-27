@@ -250,14 +250,46 @@ printf %s "$KEY" | sha256sum | cut -d' ' -f1     # put this in "key_sha256"
 | Request | Answer |
 |---|---|
 | `GET /v1/version` | `version`, `generado_en`, `publicado_en`, `total`, `ultimo_cambio` |
+| `GET /v1/versiones` | `{"actual": "<version>", "versiones": ["<oldest>", ..., "<newest>"]}`: the versions still kept in Redis, in the order of `nt:versiones`. `503` when nothing is published |
 | `GET /v1/productos?limit=500&cursor=` | every product with the columns of `NT_API_FIELDS`, in pages. Follow `siguiente` until it is empty |
 | `GET /v1/productos/{id}` | one product (row key; `#` travels as `%23`, e.g. `/v1/productos/3%232`) |
-| `GET /v1/productos?cum_facturar=123456-1` | exact filter on a field of `NT_INDEX_FIELDS` (one at a time; trimmed, case-insensitive). `offset` (up to 100000) and `limit` to page, `total` in the answer |
+| `GET /v1/productos?cum_facturar=123456-1` | exact filter on a field of `NT_INDEX_FIELDS` (one at a time; trimmed, case-insensitive), with the whole line of every match (see below). `offset` (up to 100000) and `limit` to page, `total` in the answer |
 | `GET /v1/productos?q=levo` | text search over `NT_SEARCH_FIELDS` (accents ignored, contains, words of 2+ letters, up to 6; AND). `501` when search is off |
 | `GET /v1/cambios?desde=<id>&limit=500` | changes after that stream id: `eventos`, `siguiente`, `hay_mas` |
 
 A paged read keeps reading the version it started on (the cursor carries it), even if a new one is published
 in the middle; if that version was already removed the answer is `410`: start again without a cursor.
+
+**Reading a specific version.** `version`, `productos` (list, exact filters and text search) and
+`productos/{id}` accept `?version=<v>`, one of the versions of `/v1/versiones`; a client that pins the version
+of each loading re-reads that exact one later. Without it nothing changes: the current version is read.
+
+- A version that does not exist or was already removed (`REDIS_KEEP_VERSIONS` keeps two by default; it also
+  covers one that was removed while the answer was being built) is `404 {"error": "..."}`, and so is a value
+  that cannot be a version. An empty or repeated `version` is `400`, so a client never reads the current
+  version by mistake.
+- A cursor already carries its version: `version` together with the cursor of another version is `400`.
+  Without `version`, the cursor decides, as before (and `410` if it was removed).
+- `ultimo_cambio` of `/v1/version?version=` is the stream position recorded when that version was published
+  (`0-0` for an old version published before that was recorded). `/v1/cambios` takes no `version`.
+- The text search of a version needs that version to have been published with `NT_SEARCH_FIELDS` on; otherwise
+  it answers `503` like when search is not available.
+
+**The exact filter returns lines, not just matching rows.** Rows that share an `id` (a line with several PLU) are
+the row keys `id`, `id#2`, `id#3`... and the index only holds the rows that carry the value. The filter
+therefore answers with *every* row of each line it finds, even when only one variant carries the value:
+
+- Order: by base id (numeric ids compare as numbers: 9 before 10), then variant number (`id`, `id#2`, ..., `id#10`).
+  `total` counts every returned row and `offset`/`limit` page through that order.
+- A value that matches nothing is `200` with `"productos": []` and `"total": 0`.
+- A line with more than 1000 variants is refused (`500`) instead of probed until the deadline. Variants are
+  probed in widening steps, so a line of 50 rows costs a handful of Redis reads, always inside the request deadline.
+
+**Every product carries `id_fila`**: its row key (`"15158"`, or `"15158#2"` for a variant). It is added to the
+product in `productos` and `productos/{id}` and is not a column of `NT_API_FIELDS`: the `id` of the product is
+exactly what was published and is *the same* for every variant of a line, so `id_fila` is what tells them apart
+(it is the `id` of the events in `cambios`, whose `fila` does not carry it). The name is reserved: a published
+column called `id_fila` is replaced.
 
 **Staying up to date** (same idea as the Redis stream, with a cursor held by the client instead of a consumer group):
 
@@ -271,7 +303,7 @@ in the middle; if that version was already removed the answer is `410`: start ag
    stream has been trimmed at all): go back to step 1.
 
 Errors are JSON (`{"error": "..."}`): `400` bad parameter, `401` missing or unknown key, `403` price field not
-allowed, `404` no such product, `410` start again, `501` search off, `503` nothing published, search unavailable
+allowed, `404` no such product or version, `410` start again, `501` search off, `503` nothing published, search unavailable
 or too many requests in progress (retry after a second).
 
 `GET /healthz` is the health check for monitors on the same host: no key, `200 {"status":"ok"}` when Redis
