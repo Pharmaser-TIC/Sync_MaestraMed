@@ -299,16 +299,17 @@ func (s *server) pin(w http.ResponseWriter, r *http.Request) (ver string, pinned
 	return ver, true, true
 }
 
-// stillPublished runs after a pinned read: a publication can remove an old version while its rows are
-// being read, and what was read would then be a part of it. ok is false once the 404 has been written.
-func (s *server) stillPublished(w http.ResponseWriter, r *http.Request, ver string) bool {
+// stillPublished runs after a read that took several steps: a publication can remove the version while its
+// rows are being read, and what was read would then be a part of it. It answers 404 for a pinned version
+// and 410 (start again) for the current one. ok is false once that answer has been written.
+func (s *server) stillPublished(w http.ResponseWriter, r *http.Request, ver string, pinned bool) bool {
 	have, err := s.src.Versions(r.Context())
 	if err != nil {
 		s.fail(w, r, err)
 		return false
 	}
 	if !slices.Contains(have, ver) {
-		writeErr(w, http.StatusNotFound, errVersionNotFound)
+		s.failRead(w, r, publish.ErrVersionGone, pinned)
 		return false
 	}
 	return true
@@ -421,7 +422,7 @@ func (s *server) rowView(c Consumer, key string, raw []byte) (json.RawMessage, e
 
 // withRowKey adds the row key to a JSON object. It splices the key in front of the other members, so
 // the rest of the row keeps its bytes (number formats included); only a row that already has a column of
-// that name is decoded and re-encoded to replace it.
+// that name, or any escape that could spell it, is decoded and re-encoded to replace it.
 func withRowKey(row json.RawMessage, key string) (json.RawMessage, error) {
 	obj := bytes.TrimSpace(row)
 	if len(obj) < 2 || obj[0] != '{' {
@@ -431,7 +432,9 @@ func withRowKey(row json.RawMessage, key string) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	if bytes.Contains(obj, []byte(`"`+rowKeyField+`"`)) {
+	// A key can be spelled with escapes ("id\u005ffila"), so any row with a backslash is decoded to
+	// replace the column properly instead of risking a second member of the same name.
+	if bytes.IndexByte(obj, '\\') >= 0 || bytes.Contains(obj, []byte(`"`+rowKeyField+`"`)) {
 		dec := json.NewDecoder(bytes.NewReader(obj))
 		dec.UseNumber()
 		var m map[string]any
@@ -509,8 +512,7 @@ func (s *server) version(w http.ResponseWriter, r *http.Request) {
 	// the stream is not it: while a newer version is being written its events are already there, and
 	// a consumer that loads this version and follows the tail would never see them.
 	upTo := m.ChangesUpTo
-	if upTo == "" { // published by a nt-sync without that field
-		upTo = "0-0" // an older version: the tail of the stream is not its cursor; reading every change is the safe side
+	if upTo == "" { // published by a nt-sync without that field, or not finished yet
 		cur := m.Version
 		if pinned {
 			if cur, err = s.src.Current(ctx); err != nil {
@@ -518,11 +520,17 @@ func (s *server) version(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if cur == m.Version {
-			if upTo, err = s.src.ChangesEnd(ctx); err != nil {
-				s.fail(w, r, err)
-				return
-			}
+		if cur != m.Version {
+			// For the current version the tail of the stream is the cursor. For any other the tail is wrong
+			// (it holds later changes) and any position we made up would make a consumer replay or miss
+			// changes, so the answer is that there is none yet. Its rows are complete and can be read.
+			w.Header().Set("Retry-After", "1")
+			writeErr(w, http.StatusServiceUnavailable, "that version has no change cursor recorded yet (it is still being published, or it was published before cursors were recorded): retry shortly")
+			return
+		}
+		if upTo, err = s.src.ChangesEnd(ctx); err != nil {
+			s.fail(w, r, err)
+			return
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -579,7 +587,7 @@ func (s *server) producto(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	if pinned && !s.stillPublished(w, r, ver) {
+	if pinned && !s.stillPublished(w, r, ver, true) {
 		return
 	}
 	if !found {
@@ -669,7 +677,7 @@ func (s *server) list(w http.ResponseWriter, r *http.Request, token string, limi
 		s.failRead(w, r, err, pin != "")
 		return
 	}
-	if pin != "" && !s.stillPublished(w, r, ver) {
+	if pin != "" && !s.stillPublished(w, r, ver, true) {
 		return
 	}
 	prods, err := s.views(consumerOf(r), rows)
@@ -736,7 +744,7 @@ func (s *server) byField(w http.ResponseWriter, r *http.Request, field, value st
 		s.failRead(w, r, err, pin != "")
 		return
 	}
-	if pin != "" && !s.stillPublished(w, r, ver) {
+	if !s.stillPublished(w, r, ver, pin != "") {
 		return
 	}
 	prods, err := s.views(c, rows)
@@ -765,20 +773,23 @@ func (s *server) family(ctx context.Context, ver string, ids []string) ([]string
 	}
 	keys := make(map[string]bool, len(ids))
 	lines := map[string]*line{}
+	hasBase := map[string]bool{} // lines whose own row is among the matches
 	var order []*line
-	var unknown []string // bases whose own row has not been seen: only a variant matched
 	for _, id := range ids {
 		keys[id] = true
-		base, _ := splitKey(id)
+		base, n := splitKey(id)
 		if lines[base] == nil {
 			l := &line{base: base, next: 2, width: 1}
 			lines[base], order = l, append(order, l)
-			unknown = append(unknown, base)
+		}
+		if n == 1 {
+			hasBase[base] = true
 		}
 	}
-	for _, id := range ids {
-		if base, n := splitKey(id); n == 1 {
-			unknown = slices.DeleteFunc(unknown, func(b string) bool { return b == base })
+	var unknown []string // lines where only a variant matched: their own row has to be looked for
+	for _, l := range order {
+		if !hasBase[l.base] {
+			unknown = append(unknown, l.base)
 		}
 	}
 	found, err := s.probe(ctx, ver, unknown)
@@ -947,7 +958,7 @@ func (s *server) byText(w http.ResponseWriter, r *http.Request, text string, off
 		s.failRead(w, r, err, pin != "")
 		return
 	}
-	if pin != "" && !s.stillPublished(w, r, ver) {
+	if pin != "" && !s.stillPublished(w, r, ver, true) {
 		return
 	}
 	prods, err := s.views(c, rows)

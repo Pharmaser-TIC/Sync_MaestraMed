@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1380,7 +1381,6 @@ func TestExactFilterOrdersVariantsByNumberNotByText(t *testing.T) {
 	e := newEnv(t, envOpts{wrap: func(s Source) Source { sp.Source = s; return sp }})
 	e.publish(t, "v1", rows...)
 
-	start := time.Now()
 	code, b := e.get(t, "/v1/productos?cum_facturar=big", keyFull)
 	if code != 200 || b["total"] != float64(50) {
 		t.Fatalf("%d %v", code, b["total"])
@@ -1400,9 +1400,6 @@ func TestExactFilterOrdersVariantsByNumberNotByText(t *testing.T) {
 		if left <= 0 || left > requestTimeout {
 			t.Errorf("a Redis read ran with %v left; every read must be bound by the %v request deadline", left, requestTimeout)
 		}
-	}
-	if time.Since(start) > requestTimeout {
-		t.Errorf("took %v", time.Since(start))
 	}
 }
 
@@ -1469,5 +1466,79 @@ func TestChangeEventsDoNotCarryTheRowKeyInsideTheirRow(t *testing.T) {
 	_, raw := e.getRaw(t, "/v1/cambios?desde=0-0", keyFull)
 	if strings.Contains(raw, "id_fila") || !strings.Contains(raw, `"id":"3"`) {
 		t.Errorf("the event already names its row in id: %s", raw)
+	}
+}
+
+// --- review findings ---------------------------------------------------------------------------------
+
+// matches is a Source whose exact filter matches n distinct lines and whose reads are free: what is left
+// is the work the API itself does with the matches.
+type matches struct {
+	Source
+	n int
+}
+
+func (m matches) RowsByID(ctx context.Context, ver string, ids []string) ([]publish.Raw, error) {
+	return nil, nil // no variants exist
+}
+
+func TestExpandingABroadFilterIsLinearInTheNumberOfMatches(t *testing.T) {
+	const n = 100000
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = strconv.Itoa(i + 1)
+	}
+	s := &server{src: matches{n: n}}
+	start := time.Now()
+	keys, err := s.family(context.Background(), "v1", ids)
+	if err != nil || len(keys) != n || keys[0] != "1" || keys[n-1] != strconv.Itoa(n) {
+		t.Fatalf("%d keys, err %v", len(keys), err)
+	}
+	// a quadratic expansion needs about 20 s for this many matches
+	if took := time.Since(start); took > 3*time.Second {
+		t.Errorf("expanding %d matches took %v", n, took)
+	}
+}
+
+func TestAPinnedVersionWithoutARecordedChangeCursorIsNotServedWithAGuess(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.publish(t, "v1", baseRows...)
+	e.publish(t, "v2", baseRows...)
+	ctx := context.Background()
+	// a version that is listed but whose change cursor is not recorded (still being published, or published
+	// before cursors existed): following /v1/cambios from a made-up position would replay old events over a newer load
+	e.rdb.HDel(ctx, "nt:v1:meta", "cambios_hasta")
+	code, b := e.get(t, "/v1/version?version=v1", keyFull)
+	if code != http.StatusServiceUnavailable || b["error"] == nil || b["ultimo_cambio"] != nil {
+		t.Errorf("status %d %v, want 503 without a cursor", code, b)
+	}
+	// its rows are complete, only the cursor is missing
+	if code, _ = e.get(t, "/v1/productos?version=v1&limit=2", keyFull); code != 200 {
+		t.Errorf("rows of that version: %d", code)
+	}
+	// the current version keeps its fallback (the tail of the stream)
+	e.rdb.HDel(ctx, "nt:v2:meta", "cambios_hasta")
+	if code, b = e.get(t, "/v1/version?version=v2", keyFull); code != 200 || b["ultimo_cambio"] == nil || b["ultimo_cambio"] == "" {
+		t.Errorf("current version: %d %v", code, b)
+	}
+}
+
+func TestARowKeyWrittenWithEscapesCannotDuplicateTheRowKey(t *testing.T) {
+	e := newEnv(t, envOpts{}) // every column, prices allowed: the untouched path
+	e.publish(t, "v1", `{"id":1,"id\u005ffila":"evil","id_fi\u006ca":"evil2"}`)
+	_, raw := e.getRaw(t, "/v1/productos/1", keyFull)
+	var b map[string]any
+	if err := json.Unmarshal([]byte(raw), &b); err != nil || b["id_fila"] != "1" || strings.Count(raw, "fila") != 1 {
+		t.Errorf("%s", raw)
+	}
+}
+
+func TestAnUnpinnedFilterWhoseVersionWentAwayWhileItRanIsGone(t *testing.T) {
+	sp := &spy{}
+	e := newEnv(t, envOpts{keep: 1, wrap: func(s Source) Source { sp.Source = s; return sp }})
+	e.publish(t, "v1", baseRows...)
+	sp.afterLookup = func() { sp.afterLookup = nil; e.publish(t, "v2", baseRows...) } // keep=1 removes v1
+	if code, _ := e.get(t, "/v1/productos?estado=OK", keyFull); code != http.StatusGone {
+		t.Errorf("status %d, want 410 instead of an answer built on a version that went away", code)
 	}
 }

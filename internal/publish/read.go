@@ -94,7 +94,8 @@ func (p *Publisher) metaOf(ctx context.Context, ver string) (m Meta, found bool,
 }
 
 // Versions returns the versions kept in Redis, oldest first: the order of <prefix>:versiones, which is
-// scored by publication time. Only complete versions are listed (see Page).
+// scored by publication time. A version is listed once its rows and meta are written (see Page), which
+// is just before its change cursor is recorded and it becomes the current one.
 func (p *Publisher) Versions(ctx context.Context) ([]string, error) {
 	return p.rdb.ZRange(ctx, p.key("versiones"), 0, -1).Result()
 }

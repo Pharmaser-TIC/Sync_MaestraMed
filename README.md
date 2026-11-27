@@ -270,8 +270,10 @@ of each loading re-reads that exact one later. Without it nothing changes: the c
   version by mistake.
 - A cursor already carries its version: `version` together with the cursor of another version is `400`.
   Without `version`, the cursor decides, as before (and `410` if it was removed).
-- `ultimo_cambio` of `/v1/version?version=` is the stream position recorded when that version was published
-  (`0-0` for an old version published before that was recorded). `/v1/cambios` takes no `version`.
+- `ultimo_cambio` of `/v1/version?version=` is the stream position recorded when that version was published.
+  A version other than the current one that has none recorded (it is still being published, or it was
+  published before positions were recorded) answers `503` instead of a made-up position; its products can be
+  read anyway. `/v1/cambios` takes no `version`.
 - The text search of a version needs that version to have been published with `NT_SEARCH_FIELDS` on; otherwise
   it answers `503` like when search is not available.
 
@@ -282,6 +284,8 @@ therefore answers with *every* row of each line it finds, even when only one var
 - Order: by base id (numeric ids compare as numbers: 9 before 10), then variant number (`id`, `id#2`, ..., `id#10`).
   `total` counts every returned row and `offset`/`limit` page through that order.
 - A value that matches nothing is `200` with `"productos": []` and `"total": 0`.
+- If the version being read is removed while the filter runs, the answer is `404` (`?version=`) or `410`
+  (current version), never a partial list.
 - A line with more than 1000 variants is refused (`500`) instead of probed until the deadline. Variants are
   probed in widening steps, so a line of 50 rows costs a handful of Redis reads, always inside the request deadline.
 
