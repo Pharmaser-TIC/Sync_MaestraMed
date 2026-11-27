@@ -5,14 +5,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
@@ -38,8 +42,16 @@ var testIndexFields = []string{"cum_facturar", "estado", "precio_venta"}
 type fakeSearch struct {
 	*publish.Publisher
 	gotQuery string
+	gotVer   string // version of the last pinned search
 	ids      []string
 	called   bool
+}
+
+func (f *fakeSearch) SearchIDsIn(ctx context.Context, ver, query string, offset, limit int) ([]string, int, error) {
+	f.called = true
+	f.gotQuery = query
+	f.gotVer = ver
+	return f.ids, len(f.ids), nil
 }
 
 func (f *fakeSearch) SearchIDs(ctx context.Context, query string, offset, limit int) (string, []string, int, error) {
@@ -844,7 +856,12 @@ func TestOnlyTheConfiguredColumnsAreReturned(t *testing.T) {
 			if _, list := body["productos"]; list {
 				row = items(body)[0]
 			}
-			if got := keysOf(row); !slices.Equal(got, cols) {
+			// id_fila (the row key) is the only column that is not on the list: it is added to every product
+			got := slices.DeleteFunc(keysOf(row), func(k string) bool { return k == rowKeyField })
+			if _, ok := row[rowKeyField]; !ok {
+				t.Errorf("%s as %s lacks the row key", path, key)
+			}
+			if !slices.Equal(got, cols) {
 				t.Errorf("%s as %s returned columns %v, want %v", path, key, got, cols)
 			}
 		}
@@ -1054,5 +1071,474 @@ func TestTheServerRefusesTheDefaultColumnsWithAnOldPriceList(t *testing.T) {
 		Fields:      cfg.HTTP.Fields,
 	}); err != nil {
 		t.Fatalf("the shipped defaults must start: %v", err)
+	}
+}
+
+// --- versions: GET /v1/versiones and ?version= -------------------------------------------------
+
+func TestVersionsListsTheKeptVersionsOldestFirst(t *testing.T) {
+	e := newEnv(t, envOpts{keep: 3})
+	if code, _ := e.get(t, "/v1/versiones", keyFull); code != http.StatusServiceUnavailable {
+		t.Errorf("nothing published: status %d, want 503", code)
+	}
+	e.publish(t, "v1", baseRows...)
+	e.publish(t, "v2", baseRows...)
+	e.publish(t, "v3", baseRows...)
+	for _, key := range []string{keyFull, keyNoCost} {
+		code, raw := e.getRaw(t, "/v1/versiones", key)
+		if want := `{"actual":"v3","versiones":["v1","v2","v3"]}`; code != 200 || strings.TrimSpace(raw) != want {
+			t.Errorf("%s: %d %q, want %s", key, code, raw, want)
+		}
+	}
+	if code, _ := e.get(t, "/v1/versiones", ""); code != http.StatusUnauthorized {
+		t.Errorf("without a key: status %d, want 401", code)
+	}
+
+	e.publish(t, "v4", baseRows...) // keep=3 drops v1
+	if _, raw := e.getRaw(t, "/v1/versiones", keyFull); strings.TrimSpace(raw) != `{"actual":"v4","versiones":["v2","v3","v4"]}` {
+		t.Errorf("after pruning: %q", raw)
+	}
+}
+
+func publishTwoVersions(t *testing.T, e *env) {
+	t.Helper()
+	e.publish(t, "v1",
+		`{"id":1,"cum_facturar":"A-1","nombre":"OLD ONE","precio_venta":10,"estado":"OK"}`,
+		`{"id":2,"cum_facturar":"A-2","nombre":"OLD TWO","precio_venta":20,"estado":"OK"}`)
+	e.publish(t, "v2",
+		`{"id":1,"cum_facturar":"A-1","nombre":"NEW ONE","precio_venta":11,"estado":"OK"}`,
+		`{"id":2,"cum_facturar":"A-2","nombre":"NEW TWO","precio_venta":21,"estado":"OK"}`,
+		`{"id":3,"cum_facturar":"A-3","nombre":"NEW THREE","precio_venta":31,"estado":"OK"}`)
+}
+
+func TestVersionParamReadsThatExactVersionOnEveryEndpoint(t *testing.T) {
+	e := newEnv(t, envOpts{searchFields: []string{"nombre"}})
+	publishTwoVersions(t, e)
+	e.fs.ids = []string{"1"}
+
+	for _, key := range []string{keyFull, keyNoCost} {
+		// the current version without the parameter, exactly as before
+		_, b := e.get(t, "/v1/productos?cum_facturar=A-1", key)
+		if b["version"] != "v2" || items(b)[0]["nombre"] != "NEW ONE" {
+			t.Errorf("%s: no parameter must read the current version: %v", key, b)
+		}
+
+		code, b := e.get(t, "/v1/productos?limit=10&version=v1", key)
+		if code != 200 || b["version"] != "v1" || len(items(b)) != 2 {
+			t.Errorf("%s list: %d %v", key, code, b)
+		}
+		code, b = e.get(t, "/v1/productos/1?version=v1", key)
+		if code != 200 || b["nombre"] != "OLD ONE" {
+			t.Errorf("%s one product: %d %v", key, code, b)
+		}
+		if code, b = e.get(t, "/v1/productos/3?version=v1", key); code != http.StatusNotFound {
+			t.Errorf("%s: a product that only exists in v2 is not in v1: %d %v", key, code, b)
+		}
+		code, b = e.get(t, "/v1/productos?cum_facturar=A-1&version=v1", key)
+		if code != 200 || b["version"] != "v1" || b["total"] != float64(1) || items(b)[0]["nombre"] != "OLD ONE" {
+			t.Errorf("%s exact filter: %d %v", key, code, b)
+		}
+		e.fs.gotVer = ""
+		code, b = e.get(t, "/v1/productos?q=one&version=v1", key)
+		if code != 200 || b["version"] != "v1" || e.fs.gotVer != "v1" || items(b)[0]["nombre"] != "OLD ONE" {
+			t.Errorf("%s text search: %d %v (searched version %q)", key, code, b, e.fs.gotVer)
+		}
+		code, b = e.get(t, "/v1/version?version=v1", key)
+		if code != 200 || b["version"] != "v1" || b["total"] != float64(2) {
+			t.Errorf("%s version: %d %v", key, code, b)
+		}
+		if code, b = e.get(t, "/v1/version?version=v2", key); code != 200 || b["version"] != "v2" || b["total"] != float64(3) {
+			t.Errorf("%s the current version can be named too: %d %v", key, code, b)
+		}
+	}
+	// the price rule does not depend on the version that is read
+	_, raw := e.getRaw(t, "/v1/productos?limit=10&version=v1", keyNoCost)
+	if strings.Contains(raw, "precio_venta") {
+		t.Errorf("a pinned read leaked a price: %s", raw)
+	}
+	if _, raw = e.getRaw(t, "/v1/productos/1?version=v1", keyFull); !strings.Contains(raw, `"precio_venta":10`) {
+		t.Errorf("a project with prices lost them on a pinned read: %s", raw)
+	}
+}
+
+func TestPinnedVersionStartCursorOfTheChangesBelongsToThatVersion(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.publish(t, "v1", baseRows[:2]...)
+	e.publish(t, "v2", baseRows...)
+	_, v1 := e.get(t, "/v1/version?version=v1", keyFull)
+	_, v2 := e.get(t, "/v1/version?version=v2", keyFull)
+	if v1["ultimo_cambio"] == v2["ultimo_cambio"] || v1["ultimo_cambio"] == nil {
+		t.Errorf("each version reports the change cursor recorded when it was published: v1=%v v2=%v", v1["ultimo_cambio"], v2["ultimo_cambio"])
+	}
+}
+
+func TestAnUnknownOrRemovedVersionIs404OnEveryEndpoint(t *testing.T) {
+	e := newEnv(t, envOpts{keep: 1, searchFields: []string{"nombre"}})
+	e.publish(t, "v1", baseRows...)
+	e.publish(t, "v2", baseRows...) // keep=1: v1 is removed
+	// a half-written version: rows exist but it was never listed in nt:versiones
+	e.rdb.HSet(context.Background(), "nt:v9:filas", "1", `{"id":1,"nombre":"DRAFT"}`)
+
+	for _, ver := range []string{"v1", "nope", "v9", "a%2Fb", "..%2Fx", strings.Repeat("a", 300)} {
+		for _, path := range []string{"/v1/productos?version=", "/v1/productos/1?version=", "/v1/version?version=",
+			"/v1/productos?estado=OK&version=", "/v1/productos?q=acido&version="} {
+			code, b := e.get(t, path+ver, keyFull)
+			if code != http.StatusNotFound || b["error"] == nil {
+				t.Errorf("%s%s: %d %v, want 404 with an error", path, ver, code, b)
+			}
+		}
+	}
+}
+
+func TestAnEmptyOrRepeatedVersionParameterIsRejected(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.publish(t, "v1", baseRows...)
+	for _, q := range []string{"version=", "version=v1&version=v1", "version=v1&version="} {
+		// reading the current version when the caller meant to pin one would be silent and wrong
+		if code, _ := e.get(t, "/v1/productos?"+q, keyFull); code != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 400", q, code)
+		}
+	}
+}
+
+func TestVersionAndCursorMustAgree(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.publish(t, "v1", baseRows...)
+	e.publish(t, "v2", baseRows...)
+	_, first := e.get(t, "/v1/productos?limit=2&version=v1", keyFull)
+	next, _ := first["siguiente"].(string)
+	if first["version"] != "v1" || next == "" {
+		t.Fatalf("%v", first)
+	}
+	if code, _ := e.get(t, "/v1/productos?version=v2&cursor="+url.QueryEscape(next), keyFull); code != http.StatusBadRequest {
+		t.Errorf("version and cursor of different versions: status %d, want 400", code)
+	}
+	code, b := e.get(t, "/v1/productos?limit=100&version=v1&cursor="+url.QueryEscape(next), keyFull)
+	if code != 200 || b["version"] != "v1" || len(items(b)) != 3 {
+		t.Errorf("the same version continues the read: %d %v", code, b)
+	}
+	// without version the cursor still decides, as before
+	if code, b = e.get(t, "/v1/productos?limit=100&cursor="+url.QueryEscape(next), keyFull); code != 200 || b["version"] != "v1" {
+		t.Errorf("a cursor alone: %d %v", code, b)
+	}
+}
+
+func TestTheChangeStreamIgnoresTheVersionParameter(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.publish(t, "v1", baseRows...)
+	if code, _ := e.get(t, "/v1/cambios?desde=0-0&version=nope", keyFull); code != 200 {
+		t.Errorf("status %d, want 200", code)
+	}
+}
+
+// spy wraps the Source of a test to count its calls, see their deadlines and react after a lookup.
+type spy struct {
+	Source
+	mu          sync.Mutex
+	calls       int
+	deadlines   []time.Duration // time left on the request context at each call; 0 when it had none
+	afterLookup func()
+	infinite    bool // claims every variant key exists
+}
+
+func (s *spy) note(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if d, ok := ctx.Deadline(); ok {
+		s.deadlines = append(s.deadlines, time.Until(d))
+	} else {
+		s.deadlines = append(s.deadlines, 0)
+	}
+}
+
+func (s *spy) Lookup(ctx context.Context, ver, field, value string) ([]string, error) {
+	s.note(ctx)
+	ids, err := s.Source.Lookup(ctx, ver, field, value)
+	if s.afterLookup != nil {
+		s.afterLookup()
+	}
+	return ids, err
+}
+
+func (s *spy) RowsByID(ctx context.Context, ver string, ids []string) ([]publish.Raw, error) {
+	s.note(ctx)
+	if !s.infinite {
+		return s.Source.RowsByID(ctx, ver, ids)
+	}
+	var out []publish.Raw
+	for _, id := range ids {
+		if strings.Contains(id, "#") {
+			out = append(out, publish.Raw{ID: id, JSON: json.RawMessage(`{"id":1}`)})
+		}
+	}
+	return out, nil
+}
+
+func TestAPinnedVersionRemovedWhileItIsBeingReadIsNotServedPartially(t *testing.T) {
+	sp := &spy{}
+	e := newEnv(t, envOpts{keep: 2, wrap: func(s Source) Source { sp.Source = s; return sp }})
+	e.publish(t, "v1", baseRows...)
+	e.publish(t, "v2", baseRows...)
+	// a publication that prunes v1 lands between the lookup and the rows being read
+	sp.afterLookup = func() { sp.afterLookup = nil; e.publish(t, "v3", baseRows...) }
+	code, b := e.get(t, "/v1/productos?estado=OK&version=v1", keyFull)
+	if code != http.StatusNotFound {
+		t.Errorf("status %d %v, want 404 rather than a 200 built on a version that went away", code, b)
+	}
+}
+
+// --- exact filter contract ---------------------------------------------------------------------
+
+func rowKeys(body map[string]any) []string {
+	var out []string
+	for _, r := range items(body) {
+		k, _ := r["id_fila"].(string)
+		out = append(out, k)
+	}
+	return out
+}
+
+var familyRows = []string{
+	`{"id":9,"cum_facturar":"F-9","plu":"a"}`,
+	`{"id":9,"cum_facturar":"F-9","plu":"b"}`,
+	`{"id":10,"cum_facturar":"OTHER","plu":"c"}`,
+	`{"id":10,"cum_facturar":"F-9","plu":"d"}`,
+	`{"id":10,"plu":"e"}`,
+	`{"id":11,"cum_facturar":"NOPE","plu":"f"}`,
+}
+
+func TestExactFilterReturnsEveryRowOfTheLineInBaseIDThenVariantOrder(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.publish(t, "v1", familyRows...)
+	want := []string{"9", "9#2", "10", "10#2", "10#3"}
+
+	for _, key := range []string{keyFull, keyNoCost} {
+		code, b := e.get(t, "/v1/productos?cum_facturar="+url.QueryEscape("  f-9 ")+"&version=v1", key)
+		if code != 200 || b["version"] != "v1" || b["total"] != float64(5) || b["siguiente"] != "" {
+			t.Fatalf("%s: %d %v", key, code, b)
+		}
+		// 10#2 matches but 10 does not: the whole family comes along; 10 sorts after 9 (numeric id), not before it
+		if got := rowKeys(b); !slices.Equal(got, want) {
+			t.Errorf("%s: row keys %v, want %v", key, got, want)
+		}
+		for i, r := range items(b) {
+			if r["plu"] == nil || (i < 2 && r["id"] != float64(9)) || (i >= 2 && r["id"] != float64(10)) {
+				t.Errorf("%s: the id column must keep what was published: %v", key, r)
+			}
+		}
+	}
+
+	// paging walks the same order, and total always counts the whole family
+	var all []string
+	path := "/v1/productos?cum_facturar=F-9&limit=2"
+	for pages := 0; pages < 6; pages++ {
+		_, b := e.get(t, path, keyFull)
+		if b["total"] != float64(5) {
+			t.Fatalf("total %v on %s", b["total"], path)
+		}
+		all = append(all, rowKeys(b)...)
+		next, _ := b["siguiente"].(string)
+		if next == "" {
+			break
+		}
+		path = "/v1/productos?cum_facturar=F-9&limit=2&offset=" + next
+	}
+	if !slices.Equal(all, want) {
+		t.Errorf("paged rows %v, want %v", all, want)
+	}
+}
+
+func TestExactFilterWithAValueThatMatchesNothingIsAnEmptyList(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.publish(t, "v1", familyRows...)
+	code, raw := e.getRaw(t, "/v1/productos?cum_facturar=NO-SUCH&version=v1", keyFull)
+	var b struct {
+		Version   string `json:"version"`
+		Total     *int   `json:"total"`
+		Productos []any  `json:"productos"`
+		Siguiente string `json:"siguiente"`
+	}
+	if err := json.Unmarshal([]byte(raw), &b); err != nil || code != 200 || b.Version != "v1" || b.Total == nil || *b.Total != 0 ||
+		b.Productos == nil || len(b.Productos) != 0 || b.Siguiente != "" {
+		t.Errorf("%d %s", code, raw)
+	}
+	if !strings.Contains(raw, `"productos":[]`) {
+		t.Errorf("productos must be an empty array, not null: %s", raw)
+	}
+}
+
+func TestExactFilterOrdersVariantsByNumberNotByText(t *testing.T) {
+	rows := make([]string, 0, 50)
+	for i := 1; i <= 50; i++ {
+		cum := ""
+		if i == 37 {
+			cum = `,"cum_facturar":"BIG"` // only one variant of the line is in the index
+		}
+		rows = append(rows, fmt.Sprintf(`{"id":1,"plu":"p%d"%s}`, i, cum))
+	}
+	sp := &spy{}
+	e := newEnv(t, envOpts{wrap: func(s Source) Source { sp.Source = s; return sp }})
+	e.publish(t, "v1", rows...)
+
+	code, b := e.get(t, "/v1/productos?cum_facturar=big", keyFull)
+	if code != 200 || b["total"] != float64(50) {
+		t.Fatalf("%d %v", code, b["total"])
+	}
+	got := rowKeys(b)
+	if len(got) != 50 || got[0] != "1" || got[1] != "1#2" || got[9] != "1#10" || got[49] != "1#50" {
+		t.Errorf("order %v", got)
+	}
+
+	// a family of 50 rows must not cost one round trip per row, and every call carries the request deadline
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	if sp.calls > 12 {
+		t.Errorf("%d Redis reads for one filter of 50 rows", sp.calls)
+	}
+	for _, left := range sp.deadlines {
+		if left <= 0 || left > requestTimeout {
+			t.Errorf("a Redis read ran with %v left; every read must be bound by the %v request deadline", left, requestTimeout)
+		}
+	}
+}
+
+func TestAFamilyThatNeverEndsIsRefusedInsteadOfLoopingUntilTheDeadline(t *testing.T) {
+	sp := &spy{infinite: true}
+	e := newEnv(t, envOpts{wrap: func(s Source) Source { sp.Source = s; return sp }})
+	e.publish(t, "v1", `{"id":1,"cum_facturar":"X"}`)
+	start := time.Now()
+	code, _ := e.get(t, "/v1/productos?cum_facturar=X", keyFull)
+	if code != http.StatusInternalServerError || time.Since(start) > 5*time.Second {
+		t.Errorf("status %d after %v, want a quick 500", code, time.Since(start))
+	}
+}
+
+// --- every product carries its row key -----------------------------------------------------------
+
+func TestEveryProductCarriesItsRowKeyWhateverTheEndpoint(t *testing.T) {
+	e := newEnv(t, envOpts{searchFields: []string{"nombre"}, fields: []string{"id", "nombre", "precio_venta", "estado"}})
+	e.publish(t, "v1", baseRows...) // two rows share id 3: the second one is the row "3#2"
+	e.fs.ids = []string{"3#2"}
+
+	for _, key := range []string{keyFull, keyNoCost} {
+		_, one := e.get(t, "/v1/productos/3%232", key)
+		if one["id_fila"] != "3#2" || one["id"] != float64(3) {
+			t.Errorf("%s one product: %v", key, one)
+		}
+		_, base := e.get(t, "/v1/productos/1", key)
+		if base["id_fila"] != "1" {
+			t.Errorf("%s: %v", key, base)
+		}
+		_, list := e.get(t, "/v1/productos?limit=10", key)
+		got := rowKeys(list)
+		slices.Sort(got)
+		if !slices.Equal(got, []string{"1", "2", "3", "3#2", "5"}) {
+			t.Errorf("%s list: %v", key, got)
+		}
+		if _, f := e.get(t, "/v1/productos?estado=ok", key); !slices.Contains(rowKeys(f), "3#2") {
+			t.Errorf("%s filter: %v", key, rowKeys(f))
+		}
+		if _, q := e.get(t, "/v1/productos?q=gotas", key); !slices.Equal(rowKeys(q), []string{"3#2"}) {
+			t.Errorf("%s search: %v", key, rowKeys(q))
+		}
+	}
+}
+
+func TestTheRowKeyIsOursEvenWhenARowBringsAColumnWithThatName(t *testing.T) {
+	e := newEnv(t, envOpts{}) // every column, prices allowed: the untouched path
+	e.publish(t, "v1", `{"id":1,"valor":10.50,"lista":[1.0],"id_fila":"evil"}`, `{"id":2,"valor":1.0}`)
+	_, raw := e.getRaw(t, "/v1/productos/1", keyFull)
+	var b map[string]any
+	if err := json.Unmarshal([]byte(raw), &b); err != nil || b["id_fila"] != "1" || strings.Count(raw, `"id_fila"`) != 1 {
+		t.Errorf("%s", raw)
+	}
+	_, raw = e.getRaw(t, "/v1/productos/2", keyFull)
+	if !strings.Contains(raw, `"valor":1.0`) || !strings.Contains(raw, `"id_fila":"2"`) {
+		t.Errorf("a row without that column keeps its numbers as published: %s", raw)
+	}
+}
+
+func TestChangeEventsDoNotCarryTheRowKeyInsideTheirRow(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.publish(t, "v1", baseRows[:2]...)
+	e.publish(t, "v2", baseRows[:3]...)
+	_, raw := e.getRaw(t, "/v1/cambios?desde=0-0", keyFull)
+	if strings.Contains(raw, "id_fila") || !strings.Contains(raw, `"id":"3"`) {
+		t.Errorf("the event already names its row in id: %s", raw)
+	}
+}
+
+// --- review findings ---------------------------------------------------------------------------------
+
+// matches is a Source whose exact filter matches n distinct lines and whose reads are free: what is left
+// is the work the API itself does with the matches.
+type matches struct {
+	Source
+	n int
+}
+
+func (m matches) RowsByID(ctx context.Context, ver string, ids []string) ([]publish.Raw, error) {
+	return nil, nil // no variants exist
+}
+
+func TestExpandingABroadFilterIsLinearInTheNumberOfMatches(t *testing.T) {
+	const n = 100000
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = strconv.Itoa(i + 1)
+	}
+	s := &server{src: matches{n: n}}
+	start := time.Now()
+	keys, err := s.family(context.Background(), "v1", ids)
+	if err != nil || len(keys) != n || keys[0] != "1" || keys[n-1] != strconv.Itoa(n) {
+		t.Fatalf("%d keys, err %v", len(keys), err)
+	}
+	// a quadratic expansion needs about 20 s for this many matches
+	if took := time.Since(start); took > 3*time.Second {
+		t.Errorf("expanding %d matches took %v", n, took)
+	}
+}
+
+func TestAPinnedVersionWithoutARecordedChangeCursorIsNotServedWithAGuess(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.publish(t, "v1", baseRows...)
+	e.publish(t, "v2", baseRows...)
+	ctx := context.Background()
+	// a version that is listed but whose change cursor is not recorded (still being published, or published
+	// before cursors existed): following /v1/cambios from a made-up position would replay old events over a newer load
+	e.rdb.HDel(ctx, "nt:v1:meta", "cambios_hasta")
+	code, b := e.get(t, "/v1/version?version=v1", keyFull)
+	if code != http.StatusServiceUnavailable || b["error"] == nil || b["ultimo_cambio"] != nil {
+		t.Errorf("status %d %v, want 503 without a cursor", code, b)
+	}
+	// its rows are complete, only the cursor is missing
+	if code, _ = e.get(t, "/v1/productos?version=v1&limit=2", keyFull); code != 200 {
+		t.Errorf("rows of that version: %d", code)
+	}
+	// the current version keeps its fallback (the tail of the stream)
+	e.rdb.HDel(ctx, "nt:v2:meta", "cambios_hasta")
+	if code, b = e.get(t, "/v1/version?version=v2", keyFull); code != 200 || b["ultimo_cambio"] == nil || b["ultimo_cambio"] == "" {
+		t.Errorf("current version: %d %v", code, b)
+	}
+}
+
+func TestARowKeyWrittenWithEscapesCannotDuplicateTheRowKey(t *testing.T) {
+	e := newEnv(t, envOpts{}) // every column, prices allowed: the untouched path
+	e.publish(t, "v1", `{"id":1,"id\u005ffila":"evil","id_fi\u006ca":"evil2"}`)
+	_, raw := e.getRaw(t, "/v1/productos/1", keyFull)
+	var b map[string]any
+	if err := json.Unmarshal([]byte(raw), &b); err != nil || b["id_fila"] != "1" || strings.Count(raw, "fila") != 1 {
+		t.Errorf("%s", raw)
+	}
+}
+
+func TestAnUnpinnedFilterWhoseVersionWentAwayWhileItRanIsGone(t *testing.T) {
+	sp := &spy{}
+	e := newEnv(t, envOpts{keep: 1, wrap: func(s Source) Source { sp.Source = s; return sp }})
+	e.publish(t, "v1", baseRows...)
+	sp.afterLookup = func() { sp.afterLookup = nil; e.publish(t, "v2", baseRows...) } // keep=1 removes v1
+	if code, _ := e.get(t, "/v1/productos?estado=OK", keyFull); code != http.StatusGone {
+		t.Errorf("status %d, want 410 instead of an answer built on a version that went away", code)
 	}
 }

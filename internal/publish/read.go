@@ -63,13 +63,49 @@ func (p *Publisher) Meta(ctx context.Context) (Meta, error) {
 	if ver == "" {
 		return Meta{}, ErrNothingPublished
 	}
+	m, _, err := p.metaOf(ctx, ver)
+	return m, err
+}
+
+// MetaOf returns the metadata of a published version, the current one or an older one that is still
+// kept. ErrVersionGone means it is not listed in <prefix>:versiones (never published, or pruned).
+func (p *Publisher) MetaOf(ctx context.Context, ver string) (Meta, error) {
+	if ok, err := p.hasVersion(ctx, ver); err != nil {
+		return Meta{}, err
+	} else if !ok {
+		return Meta{}, ErrVersionGone
+	}
+	m, found, err := p.metaOf(ctx, ver)
+	if err == nil && !found {
+		err = ErrVersionGone
+	}
+	return m, err
+}
+
+// metaOf reads the meta hash of ver; found is false when the hash does not exist.
+func (p *Publisher) metaOf(ctx context.Context, ver string) (m Meta, found bool, err error) {
 	h, err := p.rdb.HGetAll(ctx, p.key(ver, "meta")).Result()
 	if err != nil {
-		return Meta{}, err
+		return Meta{}, false, err
 	}
-	m := Meta{Version: ver, GeneradoEn: h["generado_en"], PublicadoEn: h["publicado_en"], ChangesUpTo: h["cambios_hasta"]}
+	m = Meta{Version: ver, GeneradoEn: h["generado_en"], PublicadoEn: h["publicado_en"], ChangesUpTo: h["cambios_hasta"]}
 	m.Total, _ = strconv.ParseInt(h["total"], 10, 64)
-	return m, nil
+	return m, len(h) > 0, nil
+}
+
+// Versions returns the versions kept in Redis, oldest first: the order of <prefix>:versiones, which is
+// scored by publication time. A version is listed once its rows and meta are written (see Page), which
+// is just before its change cursor is recorded and it becomes the current one.
+func (p *Publisher) Versions(ctx context.Context) ([]string, error) {
+	return p.rdb.ZRange(ctx, p.key("versiones"), 0, -1).Result()
+}
+
+func (p *Publisher) hasVersion(ctx context.Context, ver string) (bool, error) {
+	_, err := p.rdb.ZScore(ctx, p.key("versiones"), ver).Result()
+	if err == redis.Nil {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // Page returns at most `limit` rows of version ver, starting at position (cursor, skip), and the
@@ -155,7 +191,23 @@ func (p *Publisher) RowsByID(ctx context.Context, ver string, ids []string) ([]R
 // version, the matching row keys and the total number of matches. The query is passed as is: the
 // caller must build it from sanitized terms.
 func (p *Publisher) SearchIDs(ctx context.Context, query string, offset, limit int) (string, []string, int, error) {
-	res, err := p.rdb.FTSearchWithArgs(ctx, p.AliasName(), query, &redis.FTSearchOptions{
+	return p.ftSearch(ctx, p.AliasName(), query, offset, limit)
+}
+
+// SearchIDsIn runs the same query against the index of a given version instead of the alias, and
+// returns the matching row keys and the total. The version must be one that is still published.
+func (p *Publisher) SearchIDsIn(ctx context.Context, ver, query string, offset, limit int) ([]string, int, error) {
+	if ok, err := p.hasVersion(ctx, ver); err != nil {
+		return nil, 0, err
+	} else if !ok {
+		return nil, 0, ErrVersionGone
+	}
+	_, ids, total, err := p.ftSearch(ctx, p.indexName(ver), query, offset, limit)
+	return ids, total, err
+}
+
+func (p *Publisher) ftSearch(ctx context.Context, index, query string, offset, limit int) (string, []string, int, error) {
+	res, err := p.rdb.FTSearchWithArgs(ctx, index, query, &redis.FTSearchOptions{
 		NoContent: true, LimitOffset: offset, Limit: limit,
 	}).Result()
 	if err != nil {

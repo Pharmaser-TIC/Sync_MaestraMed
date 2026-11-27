@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -29,6 +30,13 @@ const (
 	minTermLen   = 2
 	maxOffset    = 100000 // RediSearch refuses to page past its own result cap anyway
 
+	// An exact filter also returns the whole line of every row it finds (see family). The variants of a
+	// line are probed in widening steps; a line with more than maxFamily variants is not something the
+	// publisher writes, so it is refused instead of probed until the request deadline.
+	probeBatch    = 1000 // keys per Redis read
+	maxProbeWidth = 256  // variants probed per line in one round
+	maxFamily     = 1000
+
 	defaultInFlight = 64
 	requestTimeout  = 20 * time.Second // Redis calls of a request are cancelled after this
 	healthTimeout   = 2 * time.Second
@@ -39,12 +47,15 @@ type Source interface {
 	Ping(ctx context.Context) error
 	Current(ctx context.Context) (string, error)
 	Meta(ctx context.Context) (publish.Meta, error)
+	MetaOf(ctx context.Context, ver string) (publish.Meta, error)
+	Versions(ctx context.Context) ([]string, error)
 	ChangesEnd(ctx context.Context) (string, error)
 	Page(ctx context.Context, ver string, cursor uint64, skip, limit int) ([]publish.Raw, uint64, int, error)
 	Row(ctx context.Context, ver, id string) ([]byte, bool, error)
 	Lookup(ctx context.Context, ver, field, value string) ([]string, error)
 	RowsByID(ctx context.Context, ver string, ids []string) ([]publish.Raw, error)
 	SearchIDs(ctx context.Context, query string, offset, limit int) (string, []string, int, error)
+	SearchIDsIn(ctx context.Context, ver, query string, offset, limit int) ([]string, int, error)
 	ChangesSince(ctx context.Context, after string, limit int) ([]publish.ChangeEvent, bool, bool, error)
 }
 
@@ -115,6 +126,7 @@ func New(src Source, opt Options) (http.Handler, error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/version", s.version)
+	mux.HandleFunc("GET /v1/versiones", s.versiones)
 	mux.HandleFunc("GET /v1/productos", s.productos)
 	mux.HandleFunc("GET /v1/productos/{id}", s.producto)
 	mux.HandleFunc("GET /v1/cambios", s.cambios)
@@ -253,6 +265,78 @@ func intParam(q url.Values, name string, def, min, max int) (int, bool) {
 	return n, true
 }
 
+// --- pinned versions ---------------------------------------------------------------------
+
+var errVersionNotFound = "that version does not exist or is no longer available: see /v1/versiones"
+
+// pin reads ?version=. pinned is false when the parameter is absent: the request then reads the current
+// version exactly as it always did. A given version must be one of /v1/versiones, otherwise the answer
+// is 404 (also for a value that could not be a version). ok is false once the answer has been written.
+func (s *server) pin(w http.ResponseWriter, r *http.Request) (ver string, pinned, ok bool) {
+	vals, has := r.URL.Query()["version"]
+	if !has {
+		return "", false, true
+	}
+	if len(vals) != 1 || vals[0] == "" {
+		// reading the current version when the caller meant to pin one would be silent and wrong
+		writeErr(w, http.StatusBadRequest, "version must be given once and not be empty")
+		return "", false, false
+	}
+	ver = vals[0]
+	if !plainVersion(ver) {
+		writeErr(w, http.StatusNotFound, errVersionNotFound)
+		return "", false, false
+	}
+	have, err := s.src.Versions(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return "", false, false
+	}
+	if !slices.Contains(have, ver) {
+		writeErr(w, http.StatusNotFound, errVersionNotFound)
+		return "", false, false
+	}
+	return ver, true, true
+}
+
+// stillPublished runs after a read that took several steps: a publication can remove the version while its
+// rows are being read, and what was read would then be a part of it. It answers 404 for a pinned version
+// and 410 (start again) for the current one. ok is false once that answer has been written.
+func (s *server) stillPublished(w http.ResponseWriter, r *http.Request, ver string, pinned bool) bool {
+	have, err := s.src.Versions(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return false
+	}
+	if !slices.Contains(have, ver) {
+		s.failRead(w, r, publish.ErrVersionGone, pinned)
+		return false
+	}
+	return true
+}
+
+// failRead answers a failed read; a pinned version that went away is a 404, as when it was named.
+func (s *server) failRead(w http.ResponseWriter, r *http.Request, err error, pinned bool) {
+	if pinned && errors.Is(err, publish.ErrVersionGone) {
+		writeErr(w, http.StatusNotFound, errVersionNotFound)
+		return
+	}
+	s.fail(w, r, err)
+}
+
+// plainVersion accepts only what a version looks like: it becomes part of Redis keys.
+func plainVersion(ver string) bool {
+	if ver == "" || len(ver) > 128 {
+		return false
+	}
+	for _, r := range ver {
+		if r != '.' && r != '_' && r != '-' && (r < '0' || r > '9') && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') {
+			return false
+		}
+	}
+	return true
+}
+
 // --- price filtering ---------------------------------------------------------------------
 
 // isPrice says whether a field name is one of the price fields. The comparison ignores case and
@@ -322,10 +406,66 @@ func (s *server) withoutPrices(v any) any {
 	return v
 }
 
+// rowKeyField carries the row key in every product the API returns. The row "id" is not unique: a line
+// with several PLU has the rows id, id#2, id#3... and all of them publish the same "id", so the key is the
+// only thing that tells them apart. The name is reserved: a published column called like this is replaced.
+const rowKeyField = "id_fila"
+
+// rowView is view plus the row key.
+func (s *server) rowView(c Consumer, key string, raw []byte) (json.RawMessage, error) {
+	v, err := s.view(c, raw)
+	if err != nil || len(v) == 0 {
+		return v, err
+	}
+	return withRowKey(v, key)
+}
+
+// withRowKey adds the row key to a JSON object. It splices the key in front of the other members, so
+// the rest of the row keeps its bytes (number formats included); only a row that already has a column of
+// that name, or any escape that could spell it, is decoded and re-encoded to replace it.
+func withRowKey(row json.RawMessage, key string) (json.RawMessage, error) {
+	obj := bytes.TrimSpace(row)
+	if len(obj) < 2 || obj[0] != '{' {
+		return row, nil
+	}
+	k, err := json.Marshal(key)
+	if err != nil {
+		return nil, err
+	}
+	// A key can be spelled with escapes ("id\u005ffila"), so any row with a backslash is decoded to
+	// replace the column properly instead of risking a second member of the same name.
+	if bytes.IndexByte(obj, '\\') >= 0 || bytes.Contains(obj, []byte(`"`+rowKeyField+`"`)) {
+		dec := json.NewDecoder(bytes.NewReader(obj))
+		dec.UseNumber()
+		var m map[string]any
+		if err := dec.Decode(&m); err != nil {
+			return nil, err
+		}
+		m[rowKeyField] = key
+		var out bytes.Buffer
+		enc := json.NewEncoder(&out)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(m); err != nil {
+			return nil, err
+		}
+		return bytes.TrimRight(out.Bytes(), "\n"), nil
+	}
+	out := make([]byte, 0, len(obj)+len(k)+len(rowKeyField)+6)
+	out = append(out, '{', '"')
+	out = append(out, rowKeyField...)
+	out = append(out, '"', ':')
+	out = append(out, k...)
+	if rest := bytes.TrimSpace(obj[1:]); len(rest) > 0 && rest[0] != '}' {
+		out = append(out, ',')
+	}
+	out = append(out, obj[1:]...)
+	return out, nil
+}
+
 func (s *server) views(c Consumer, rows []publish.Raw) ([]json.RawMessage, error) {
 	out := make([]json.RawMessage, 0, len(rows))
 	for _, r := range rows {
-		v, err := s.view(c, r.JSON)
+		v, err := s.rowView(c, r.ID, r.JSON)
 		if err != nil {
 			return nil, fmt.Errorf("row %s: %w", r.ID, err)
 		}
@@ -352,17 +492,43 @@ func (s *server) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) version(w http.ResponseWriter, r *http.Request) {
-	m, err := s.src.Meta(r.Context())
+	ctx := r.Context()
+	pin, pinned, ok := s.pin(w, r)
+	if !ok {
+		return
+	}
+	var m publish.Meta
+	var err error
+	if pinned {
+		m, err = s.src.MetaOf(ctx, pin)
+	} else {
+		m, err = s.src.Meta(ctx)
+	}
 	if err != nil {
-		s.fail(w, r, err)
+		s.failRead(w, r, err, pinned)
 		return
 	}
 	// The cursor that goes with this version is recorded when the version is published. The tail of
 	// the stream is not it: while a newer version is being written its events are already there, and
 	// a consumer that loads this version and follows the tail would never see them.
 	upTo := m.ChangesUpTo
-	if upTo == "" { // published by a nt-sync without that field
-		if upTo, err = s.src.ChangesEnd(r.Context()); err != nil {
+	if upTo == "" { // published by a nt-sync without that field, or not finished yet
+		cur := m.Version
+		if pinned {
+			if cur, err = s.src.Current(ctx); err != nil {
+				s.fail(w, r, err)
+				return
+			}
+		}
+		if cur != m.Version {
+			// For the current version the tail of the stream is the cursor. For any other the tail is wrong
+			// (it holds later changes) and any position we made up would make a consumer replay or miss
+			// changes, so the answer is that there is none yet. Its rows are complete and can be read.
+			w.Header().Set("Retry-After", "1")
+			writeErr(w, http.StatusServiceUnavailable, "that version has no change cursor recorded yet (it is still being published, or it was published before cursors were recorded): retry shortly")
+			return
+		}
+		if upTo, err = s.src.ChangesEnd(ctx); err != nil {
 			s.fail(w, r, err)
 			return
 		}
@@ -373,26 +539,62 @@ func (s *server) version(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *server) producto(w http.ResponseWriter, r *http.Request) {
+// versiones lists the versions kept in Redis, oldest first, and the one served by default.
+func (s *server) versiones(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ver, err := s.src.Current(ctx)
-	if err != nil || ver == "" {
+	cur, err := s.src.Current(ctx)
+	if err != nil || cur == "" {
 		if err == nil {
 			err = publish.ErrNothingPublished
 		}
 		s.fail(w, r, err)
 		return
 	}
-	raw, ok, err := s.src.Row(ctx, ver, r.PathValue("id"))
+	have, err := s.src.Versions(ctx)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
+	if have == nil {
+		have = []string{}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Actual    string   `json:"actual"`
+		Versiones []string `json:"versiones"`
+	}{cur, have})
+}
+
+func (s *server) producto(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	ver, pinned, ok := s.pin(w, r)
 	if !ok {
+		return
+	}
+	if !pinned {
+		var err error
+		ver, err = s.src.Current(ctx)
+		if err != nil || ver == "" {
+			if err == nil {
+				err = publish.ErrNothingPublished
+			}
+			s.fail(w, r, err)
+			return
+		}
+	}
+	key := r.PathValue("id")
+	raw, found, err := s.src.Row(ctx, ver, key)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if pinned && !s.stillPublished(w, r, ver, true) {
+		return
+	}
+	if !found {
 		writeErr(w, http.StatusNotFound, "no product with that id")
 		return
 	}
-	v, err := s.view(consumerOf(r), raw)
+	v, err := s.rowView(consumerOf(r), key, raw)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -412,10 +614,17 @@ func (s *server) productos(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "offset must be a non-negative integer")
 		return
 	}
+	pin, pinned, ok := s.pin(w, r)
+	if !ok {
+		return
+	}
+	if !pinned {
+		pin = ""
+	}
 	var filters []string
 	for name := range q {
 		switch name {
-		case "cursor", "limit", "offset", "q":
+		case "cursor", "limit", "offset", "q", "version":
 		default:
 			filters = append(filters, name)
 		}
@@ -426,26 +635,34 @@ func (s *server) productos(w http.ResponseWriter, r *http.Request) {
 	case len(filters) == 1 && q.Has("q"):
 		writeErr(w, http.StatusBadRequest, "a field filter and a text search cannot be combined")
 	case len(filters) == 1:
-		s.byField(w, r, filters[0], q.Get(filters[0]), offset, limit)
+		s.byField(w, r, filters[0], q.Get(filters[0]), offset, limit, pin)
 	case q.Has("q"):
-		s.byText(w, r, q.Get("q"), offset, limit)
+		s.byText(w, r, q.Get("q"), offset, limit, pin)
 	default:
-		s.list(w, r, q.Get("cursor"), limit)
+		s.list(w, r, q.Get("cursor"), limit, pin)
 	}
 }
 
-func (s *server) list(w http.ResponseWriter, r *http.Request, token string, limit int) {
+// list pages through a version. pin is the version asked for with ?version=, "" for none.
+func (s *server) list(w http.ResponseWriter, r *http.Request, token string, limit int, pin string) {
 	ctx := r.Context()
 	var ver string
 	var cursor uint64
 	var skip int
-	if token != "" {
+	switch {
+	case token != "":
 		var ok bool
 		if ver, cursor, skip, ok = decodeCursor(token); !ok {
 			writeErr(w, http.StatusBadRequest, "invalid cursor")
 			return
 		}
-	} else {
+		if pin != "" && pin != ver {
+			writeErr(w, http.StatusBadRequest, "version and cursor belong to different versions")
+			return
+		}
+	case pin != "":
+		ver = pin
+	default:
 		var err error
 		if ver, err = s.src.Current(ctx); err != nil || ver == "" {
 			if err == nil {
@@ -457,7 +674,10 @@ func (s *server) list(w http.ResponseWriter, r *http.Request, token string, limi
 	}
 	rows, next, nextSkip, err := s.src.Page(ctx, ver, cursor, skip, limit)
 	if err != nil {
-		s.fail(w, r, err)
+		s.failRead(w, r, err, pin != "")
+		return
+	}
+	if pin != "" && !s.stillPublished(w, r, ver, true) {
 		return
 	}
 	prods, err := s.views(consumerOf(r), rows)
@@ -472,7 +692,9 @@ func (s *server) list(w http.ResponseWriter, r *http.Request, token string, limi
 	writeJSON(w, http.StatusOK, map[string]any{"version": ver, "productos": prods, "siguiente": siguiente})
 }
 
-func (s *server) byField(w http.ResponseWriter, r *http.Request, field, value string, offset, limit int) {
+// byField is the exact filter. It answers with every row of the lines that match (see family), ordered
+// by base id and then variant number, so the caller gets the whole line whatever variant carries the value.
+func (s *server) byField(w http.ResponseWriter, r *http.Request, field, value string, offset, limit int, pin string) {
 	c := consumerOf(r)
 	// A filter is a question about the stored value, so a column the API does not return cannot be
 	// used: the answers would let a caller find out what it holds.
@@ -493,25 +715,36 @@ func (s *server) byField(w http.ResponseWriter, r *http.Request, field, value st
 		return
 	}
 	ctx := r.Context()
-	ver, err := s.src.Current(ctx)
-	if err != nil || ver == "" {
-		if err == nil {
-			err = publish.ErrNothingPublished
+	ver := pin
+	if ver == "" {
+		var err error
+		if ver, err = s.src.Current(ctx); err != nil || ver == "" {
+			if err == nil {
+				err = publish.ErrNothingPublished
+			}
+			s.fail(w, r, err)
+			return
 		}
-		s.fail(w, r, err)
-		return
 	}
 	ids, err := s.src.Lookup(ctx, ver, field, value)
 	if err != nil {
-		s.fail(w, r, err)
+		s.failRead(w, r, err, pin != "")
 		return
 	}
-	total := len(ids)
+	keys, err := s.family(ctx, ver, ids)
+	if err != nil {
+		s.failRead(w, r, err, pin != "")
+		return
+	}
+	total := len(keys)
 	start := min(offset, total)
 	end := min(start+limit, total)
-	rows, err := s.src.RowsByID(ctx, ver, ids[start:end])
+	rows, err := s.src.RowsByID(ctx, ver, keys[start:end])
 	if err != nil {
-		s.fail(w, r, err)
+		s.failRead(w, r, err, pin != "")
+		return
+	}
+	if !s.stillPublished(w, r, ver, pin != "") {
 		return
 	}
 	prods, err := s.views(c, rows)
@@ -526,7 +759,156 @@ func (s *server) byField(w http.ResponseWriter, r *http.Request, field, value st
 	writeJSON(w, http.StatusOK, map[string]any{"version": ver, "total": total, "productos": prods, "siguiente": siguiente})
 }
 
-func (s *server) byText(w http.ResponseWriter, r *http.Request, text string, offset, limit int) {
+// family expands the row keys an index returned into every row of their lines: the row "id" itself and
+// its variants id#2, id#3... (rows that share an id are numbered in publication order, so they are
+// contiguous). The index only holds the rows that carry the value, but the caller asked about a line, and
+// a line is read as a whole. The keys come back sorted by base id (numerically when both are numbers) and
+// then by variant number. Variants are probed in widening steps, so a line of 50 rows takes a handful of
+// reads, not 50.
+func (s *server) family(ctx context.Context, ver string, ids []string) ([]string, error) {
+	type line struct {
+		base  string
+		next  int // first variant not probed yet
+		width int // variants probed in the next round
+	}
+	keys := make(map[string]bool, len(ids))
+	lines := map[string]*line{}
+	hasBase := map[string]bool{} // lines whose own row is among the matches
+	var order []*line
+	for _, id := range ids {
+		keys[id] = true
+		base, n := splitKey(id)
+		if lines[base] == nil {
+			l := &line{base: base, next: 2, width: 1}
+			lines[base], order = l, append(order, l)
+		}
+		if n == 1 {
+			hasBase[base] = true
+		}
+	}
+	var unknown []string // lines where only a variant matched: their own row has to be looked for
+	for _, l := range order {
+		if !hasBase[l.base] {
+			unknown = append(unknown, l.base)
+		}
+	}
+	found, err := s.probe(ctx, ver, unknown)
+	if err != nil {
+		return nil, err
+	}
+	for k := range found {
+		keys[k] = true
+	}
+	open := order
+	for len(open) > 0 {
+		var cand []string
+		for _, l := range open {
+			if l.next-2 >= maxFamily {
+				return nil, fmt.Errorf("a line has more than %d variants", maxFamily)
+			}
+			for n := l.next; n < l.next+l.width; n++ {
+				cand = append(cand, l.base+"#"+strconv.Itoa(n))
+			}
+		}
+		found, err := s.probe(ctx, ver, cand)
+		if err != nil {
+			return nil, err
+		}
+		still := open[:0:0]
+		for _, l := range open {
+			all := true
+			for n := l.next; n < l.next+l.width; n++ {
+				if k := l.base + "#" + strconv.Itoa(n); found[k] {
+					keys[k] = true
+				} else {
+					all = false
+				}
+			}
+			if all { // the whole step existed: the line may go on
+				l.next += l.width
+				l.width = min(l.width*2, maxProbeWidth)
+				still = append(still, l)
+			}
+		}
+		open = still
+	}
+	out := make([]string, 0, len(keys))
+	for k := range keys {
+		out = append(out, k)
+	}
+	slices.SortFunc(out, compareKeys)
+	return out, nil
+}
+
+// probe says which of the given row keys exist in version ver.
+func (s *server) probe(ctx context.Context, ver string, keys []string) (map[string]bool, error) {
+	found := make(map[string]bool)
+	for start := 0; start < len(keys); start += probeBatch {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		rows, err := s.src.RowsByID(ctx, ver, keys[start:min(start+probeBatch, len(keys))])
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rows {
+			found[r.ID] = true
+		}
+	}
+	return found, nil
+}
+
+// splitKey separates a row key into its base id and its variant number: "15158" is (15158, 1) and
+// "15158#3" is (15158, 3). Only a canonical "#<number>" of 2 or more is a variant suffix.
+func splitKey(key string) (base string, n int) {
+	if i := strings.LastIndexByte(key, '#'); i > 0 {
+		if v, err := strconv.Atoi(key[i+1:]); err == nil && v >= 2 && strconv.Itoa(v) == key[i+1:] {
+			return key[:i], v
+		}
+	}
+	return key, 1
+}
+
+// compareKeys orders row keys by base id and then variant number. Numeric ids go first and compare as
+// numbers ("9" before "10"); any other id compares as text.
+func compareKeys(a, b string) int {
+	ab, an := splitKey(a)
+	bb, bn := splitKey(b)
+	if c := compareBase(ab, bb); c != 0 {
+		return c
+	}
+	return cmp.Compare(an, bn)
+}
+
+func compareBase(a, b string) int {
+	an, bn := isDigits(a), isDigits(b)
+	switch {
+	case an && bn:
+		ta, tb := strings.TrimLeft(a, "0"), strings.TrimLeft(b, "0")
+		if len(ta) != len(tb) {
+			return cmp.Compare(len(ta), len(tb))
+		}
+		if c := strings.Compare(ta, tb); c != 0 {
+			return c
+		}
+	case an:
+		return -1
+	case bn:
+		return 1
+	}
+	return strings.Compare(a, b)
+}
+
+func isDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return s != ""
+}
+
+func (s *server) byText(w http.ResponseWriter, r *http.Request, text string, offset, limit int, pin string) {
 	c := consumerOf(r)
 	if len(s.search) == 0 {
 		writeErr(w, http.StatusNotImplemented, "text search is not enabled on this server")
@@ -548,8 +930,19 @@ func (s *server) byText(w http.ResponseWriter, r *http.Request, text string, off
 		return
 	}
 	ctx := r.Context()
-	ver, ids, total, err := s.src.SearchIDs(ctx, query, offset, limit)
+	ver := pin
+	var ids []string
+	var total int
+	if pin != "" {
+		ids, total, err = s.src.SearchIDsIn(ctx, pin, query, offset, limit)
+	} else {
+		ver, ids, total, err = s.src.SearchIDs(ctx, query, offset, limit)
+	}
 	if err != nil {
+		if pin != "" && errors.Is(err, publish.ErrVersionGone) {
+			s.failRead(w, r, err, true)
+			return
+		}
 		s.log.Error("search failed", "error", err)
 		writeErr(w, http.StatusServiceUnavailable, "text search is not available right now")
 		return
@@ -562,7 +955,10 @@ func (s *server) byText(w http.ResponseWriter, r *http.Request, text string, off
 	}
 	rows, err := s.src.RowsByID(ctx, ver, ids)
 	if err != nil {
-		s.fail(w, r, err)
+		s.failRead(w, r, err, pin != "")
+		return
+	}
+	if pin != "" && !s.stillPublished(w, r, ver, true) {
 		return
 	}
 	prods, err := s.views(c, rows)
@@ -717,13 +1113,8 @@ func decodeCursor(token string) (ver string, cursor uint64, skip int, ok bool) {
 	cursor, err1 := strconv.ParseUint(parts[1], 10, 64)
 	skip, err2 := strconv.Atoi(parts[2])
 	// the version becomes part of a Redis key: accept only what a version looks like
-	if err1 != nil || err2 != nil || skip < 0 || ver == "" || len(ver) > 128 {
+	if err1 != nil || err2 != nil || skip < 0 || !plainVersion(ver) {
 		return "", 0, 0, false
-	}
-	for _, r := range ver {
-		if r != '.' && r != '_' && r != '-' && (r < '0' || r > '9') && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') {
-			return "", 0, 0, false
-		}
 	}
 	return ver, cursor, skip, true
 }
